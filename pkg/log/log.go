@@ -26,11 +26,13 @@ func SetupDefault() {
 
 // SetupWithWriter sets up the logger with a custom writer
 func SetupWithWriter(w io.Writer) {
-	loggerOnce.Do(func() {
-		logger = slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
-		}))
-	})
+	// Allow overriding the logger for tests by skipping the once check
+	logger = slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	
+	// Reset the sync.Once to allow subsequent changes
+	loggerOnce = sync.Once{}
 }
 
 // Debug logs a debug message
