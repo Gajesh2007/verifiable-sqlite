@@ -180,13 +180,6 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
         Success:           false,
     }
 
-    // Determine which SQL string we should execute (historical jobs stored the
-    // statement in either `SQL` or the older `Query` field).
-    sqlToExecute := job.SQL
-    if sqlToExecute == "" {
-        sqlToExecute = job.Query
-    }
-
     // ---------------------------------------------------------------------
     // Build an isolated in-memory SQLite database that represents the
     // transaction's pre-state.  This guarantees deterministic, side-effect-
@@ -202,40 +195,120 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
     // Always close – the DB only lives for the duration of the verification.
     defer verificationDB.Close()
 
-    // ------------------------------------------------------------------
-    // Parse the SQL so we know which tables / rows to capture afterwards.
-    // ------------------------------------------------------------------
-    queryInfo, err := interceptor.AnalyzeQuery(sqlToExecute)
-    if err != nil {
-        result.Error = fmt.Sprintf("failed to analyze query: %v", err)
-        result.Duration = time.Since(startTime)
-        return result
-    }
-    result.QueryInfo = queryInfo
+    var tx *sql.Tx
+    var postState map[string][]types.Row
+    var postRoot string
 
-    // ------------------------------------------------------------------
-    // Execute the SQL deterministically inside a single transaction.
-    // ------------------------------------------------------------------
-    tx, err := ExecuteQueriesDeterministically(ctx, verificationDB, sqlToExecute, job.Args...)
-    if err != nil {
-        result.Error = fmt.Sprintf("failed to execute query: %v", err)
-        result.Duration = time.Since(startTime)
-        return result
-    }
-    // Rollback the tx in case we exit early; commit explicitly when we're
-    // finished so that constraints are fully applied for the post-state read.
-    defer tx.Rollback()
-
-    // ------------------------------------------------------------------
-    // Capture the resulting post-state while still inside the same tx.
-    // ------------------------------------------------------------------
-    mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
-
-    postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas, job.Args)
-    if err != nil {
-        result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
-        result.Duration = time.Since(startTime)
-        return result
+    // Check if we're dealing with a sequence of SQL statements (transaction)
+    // or a single statement
+    if len(job.SQLSequence) > 0 {
+        // ------------------------------------------------------------------
+        // Handle a sequence of SQL statements (transaction-level verification)
+        // ------------------------------------------------------------------
+        log.Debug("executing sequence of SQL statements", "count", len(job.SQLSequence))
+        
+        // Construct a single queryInfo that includes all affected tables
+        // This requires us to aggregate tables from all statements in the sequence
+        tablesMap := make(map[string]bool)
+        for _, sql := range job.SQLSequence {
+            // Parse each SQL to identify affected tables
+            queryInfo, err := interceptor.AnalyzeQuery(sql)
+            if err != nil {
+                log.Warn("failed to analyze query in sequence", "sql", sql, "error", err)
+                continue
+            }
+            
+            // Add each table to our set
+            for _, table := range queryInfo.Tables {
+                tablesMap[table] = true
+            }
+        }
+        
+        // Convert map to slice for the combined queryInfo
+        affectedTables := make([]string, 0, len(tablesMap))
+        for table := range tablesMap {
+            affectedTables = append(affectedTables, table)
+        }
+        
+        // Create a combined queryInfo for post-state capture
+        combinedQueryInfo := types.QueryInfo{
+            SQL:    "TRANSACTION", 
+            Type:   types.QueryTypeOther,
+            Tables: affectedTables,
+        }
+        
+        // Execute the sequence of SQL statements
+        tx, err = ExecuteQueriesSequenceDeterministically(ctx, verificationDB, job.SQLSequence, job.ArgsSequence)
+        if err != nil {
+            result.Error = fmt.Sprintf("failed to execute SQL sequence: %v", err)
+            result.Duration = time.Since(startTime)
+            return result
+        }
+        
+        // Rollback the tx in case we exit early
+        defer tx.Rollback()
+        
+        // ------------------------------------------------------------------
+        // Capture the resulting post-state while still inside the same tx.
+        // ------------------------------------------------------------------
+        mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
+        
+        postState, postRoot, err = capture.CapturePostStateInTx(ctx, tx, combinedQueryInfo, mockResult, job.PreStateData, job.TableSchemas, nil)
+        if err != nil {
+            result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
+            result.Duration = time.Since(startTime)
+            return result
+        }
+        
+        result.PostRootCalculated = postRoot
+        
+    } else {
+        // ------------------------------------------------------------------
+        // Handle a single SQL statement (legacy behavior)
+        // ------------------------------------------------------------------
+        // Determine which SQL string we should execute (historical jobs stored the
+        // statement in either `SQL` or the older `Query` field).
+        sqlToExecute := job.SQL
+        if sqlToExecute == "" {
+            sqlToExecute = job.Query
+        }
+    
+        // ------------------------------------------------------------------
+        // Parse the SQL so we know which tables / rows to capture afterwards.
+        // ------------------------------------------------------------------
+        queryInfo, err := interceptor.AnalyzeQuery(sqlToExecute)
+        if err != nil {
+            result.Error = fmt.Sprintf("failed to analyze query: %v", err)
+            result.Duration = time.Since(startTime)
+            return result
+        }
+        result.QueryInfo = queryInfo
+    
+        // ------------------------------------------------------------------
+        // Execute the SQL deterministically inside a single transaction.
+        // ------------------------------------------------------------------
+        tx, err = ExecuteQueriesDeterministically(ctx, verificationDB, sqlToExecute, job.Args...)
+        if err != nil {
+            result.Error = fmt.Sprintf("failed to execute query: %v", err)
+            result.Duration = time.Since(startTime)
+            return result
+        }
+        // Rollback the tx in case we exit early
+        defer tx.Rollback()
+    
+        // ------------------------------------------------------------------
+        // Capture the resulting post-state while still inside the same tx.
+        // ------------------------------------------------------------------
+        mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
+    
+        postState, postRoot, err = capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas, job.Args)
+        if err != nil {
+            result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
+            result.Duration = time.Since(startTime)
+            return result
+        }
+        
+        result.PostRootCalculated = postRoot
     }
 
     // ------------------------------------------------------------------
@@ -244,12 +317,17 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
     // verification scope and is **not** required for deterministic replay.
     // ------------------------------------------------------------------
 
-    result.PostRootCalculated = postRoot
+    if result.PostRootCalculated != job.PostRootClaimed {
+        log.Warn("post-state root mismatch", "calculated", result.PostRootCalculated, "claimed", job.PostRootClaimed)
 
-    if postRoot != job.PostRootClaimed {
-        log.Warn("post-state root mismatch", "calculated", postRoot, "claimed", job.PostRootClaimed)
-
-        mismatches := findMismatches(job.PostStateData, postState)
+        // For transaction-level verification, we need to get the postState from
+        // the outer scope, but this might be nil if there was an error
+        var mismatches []string
+        if postState != nil {
+            mismatches = findMismatches(job.PostStateData, postState)
+        } else {
+            mismatches = []string{"Failed to calculate post-state for comparison"}
+        }
         result.Mismatches = mismatches
 
         result.Duration = time.Since(startTime)

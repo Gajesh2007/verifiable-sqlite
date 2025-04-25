@@ -286,6 +286,62 @@ func ExecuteQueriesDeterministicallyWithPgx(ctx context.Context, tx pgx.Tx, quer
 	return nil
 }
 
+// ExecuteQueriesSequenceDeterministically executes a sequence of SQL queries in a deterministic manner
+func ExecuteQueriesSequenceDeterministically(ctx context.Context, db *sql.DB, sqlSequence []string, argsSequence [][]interface{}) (*sql.Tx, error) {
+	// Begin a transaction for the query execution
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+
+	// Set transaction level pragmas for deterministic execution
+	if _, err := tx.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to set foreign_keys pragma: %v", err)
+	}
+
+	// Execute each query with its corresponding arguments
+	for i, query := range sqlSequence {
+		log.Debug("executing query in verification sequence", "query", query, "sequence_index", i)
+		
+		// Get the arguments for this query, or use empty args if index out of range
+		var args []interface{}
+		if i < len(argsSequence) {
+			args = argsSequence[i]
+		}
+		
+		// Execute the query with its arguments
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("failed to execute query at index %d: %v", i, err)
+		}
+	}
+
+	// Return the transaction for state capture and commit
+	return tx, nil
+}
+
+// ExecuteQueriesSequenceDeterministicallyWithPgx executes a sequence of SQL queries with pgx
+func ExecuteQueriesSequenceDeterministicallyWithPgx(ctx context.Context, tx pgx.Tx, sqlSequence []string, argsSequence [][]interface{}) error {
+	// Execute each query in the sequence with its corresponding arguments
+	for i, query := range sqlSequence {
+		log.Debug("executing query in verification sequence with pgx", "query", query, "sequence_index", i)
+		
+		// Get the arguments for this query, or use empty args if index out of range
+		var args []interface{}
+		if i < len(argsSequence) {
+			args = argsSequence[i]
+		}
+		
+		// Execute the query with its arguments
+		if _, err := tx.Exec(ctx, query, args...); err != nil {
+			return fmt.Errorf("failed to execute query at index %d with pgx: %v", i, err)
+		}
+	}
+	
+	return nil
+}
+
 // SetDeterministicSessionParams sets SQLite session parameters for deterministic execution
 func SetDeterministicSessionParams(ctx context.Context, tx *sql.Tx) error {
 	// Set pragmas for deterministic execution

@@ -83,8 +83,10 @@ type StateCommitmentRecord struct {
 type VerificationJob struct {
 	TxID            string                   `json:"tx_id"`
 	Query           string                   `json:"query"`     // Query type/description
-	SQL             string                   `json:"sql"`       // Actual SQL to execute
-	Args            []interface{}            `json:"args"`      // Query arguments
+	SQLSequence     []string                 `json:"sql_sequence"` // Sequence of SQL statements to execute
+	ArgsSequence    [][]interface{}          `json:"args_sequence"` // Sequence of arguments for each SQL statement
+	SQL             string                   `json:"sql"`       // Actual SQL to execute (legacy field)
+	Args            []interface{}            `json:"args"`      // Query arguments (legacy field)
 	PreStateData    map[string][]Row         `json:"pre_state_data"`    // Table -> Rows
 	PostStateData   map[string][]Row         `json:"post_state_data"`   // Table -> Rows
 	TableSchemas    map[string]TableSchema   `json:"table_schemas"`     // Table -> Schema
