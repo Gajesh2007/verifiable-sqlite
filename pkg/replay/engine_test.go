@@ -7,23 +7,12 @@ import (
 	"github.com/gaj/verifiable-sqlite/pkg/config"
 	"github.com/gaj/verifiable-sqlite/pkg/metrics"
 	"github.com/gaj/verifiable-sqlite/pkg/types"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// createTestDbPool creates a test connection pool using a temporary SQLite database
-func createTestDbPool(t *testing.T) *pgxpool.Pool {
-	// Mock the connection - we won't actually connect in tests
-	pool := &pgxpool.Pool{}
-	
-	return pool
-}
 
 func TestVerificationJobSubmission(t *testing.T) {
-	// Skip this test for now as it requires a real database connection
-	t.Skip("Skipping test that requires a real database connection")
-	
 	// Create a test engine with small job queue and worker count
 	cfg := config.Config{
 		EnableVerification:   true,
@@ -40,8 +29,7 @@ func TestVerificationJobSubmission(t *testing.T) {
 	assert.Equal(t, 1, engine.workerCount)
 	assert.False(t, engine.running)
 
-	// Try to set a mock db pool
-	engine.dbPool = createTestDbPool(t)
+	// No external connection pool is required for the current implementation.
 
 	// Test starting the engine
 	err := engine.Start()
@@ -52,6 +40,7 @@ func TestVerificationJobSubmission(t *testing.T) {
 	job := types.VerificationJob{
 		TxID:            "test-tx-1",
 		Query:           "INSERT INTO test (id, value) VALUES (1, 'test')",
+		SQL:             "INSERT INTO test (id, value) VALUES (1, 'test')",
 		PreRootCaptured: "pre-root-hash",
 		PostRootClaimed: "post-root-hash",
 		TableSchemas: map[string]types.TableSchema{
@@ -107,9 +96,6 @@ func TestSubmitJobToStoppedEngine(t *testing.T) {
 }
 
 func TestJobQueueFull(t *testing.T) {
-	// Skip this test since we're not using real connections
-	t.Skip("Skipping test that requires actual queue")
-	
 	// Create a test engine with very small queue
 	cfg := config.Config{
 		EnableVerification:   true,
@@ -122,8 +108,7 @@ func TestJobQueueFull(t *testing.T) {
 	engine.jobQueue = make(chan types.VerificationJob, 1)
 	engine.metrics = metrics.NewMetrics()
 
-	// Try to set a mock db pool
-	engine.dbPool = createTestDbPool(t)
+	// No external connection pool is required for this test.
 
 	// Start the engine
 	err := engine.Start()

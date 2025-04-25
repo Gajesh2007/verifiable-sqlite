@@ -13,24 +13,26 @@ import (
 	"github.com/gaj/verifiable-sqlite/pkg/log"
 	"github.com/gaj/verifiable-sqlite/pkg/metrics"
 	"github.com/gaj/verifiable-sqlite/pkg/types"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Ensure we use sql package
 var _ sql.Result = (*MockSQLResult)(nil)
 
-// MockSQLResult implements sql.Result for use in verification
+// MockSQLResult is a minimal implementation of sql.Result tailored for the
+// verification flow.  For now we only need the two methods required by the
+// database/sql.Result interface – returning deterministic constant values is
+// sufficient for our state-capture logic during tests.
 type MockSQLResult struct {
 	lastID       int64
 	rowsAffected int64
 }
 
-// LastInsertId returns the last inserted ID - implements sql.Result
+// LastInsertId returns a deterministic last-insert id.
 func (m *MockSQLResult) LastInsertId() (int64, error) {
 	return m.lastID, nil
 }
 
-// RowsAffected returns the number of rows affected - implements sql.Result
+// RowsAffected returns the configured number of affected rows.
 func (m *MockSQLResult) RowsAffected() (int64, error) {
 	return m.rowsAffected, nil
 }
@@ -44,7 +46,6 @@ type Engine struct {
 	running     bool
 	mu          sync.Mutex
 	config      config.Config
-	dbPool      *pgxpool.Pool
 	metrics     *metrics.Metrics // Metrics collector for observability
 }
 
@@ -70,30 +71,29 @@ func (e *Engine) SetMetrics(m *metrics.Metrics) {
 
 // Start begins the verification worker pool
 func (e *Engine) Start() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+    e.mu.Lock()
+    defer e.mu.Unlock()
 
-	if e.running {
-		return nil
-	}
+    if e.running {
+        return nil
+    }
 
-	// Create a connection pool for SQLite verification
-	var err error
-	e.dbPool, err = pgxpool.New(context.Background(), "sqlite://:memory:")
-	if err != nil {
-		return fmt.Errorf("failed to create connection pool: %v", err)
-	}
+    // We do not rely on a shared connection pool any more.  Each verification
+    // job builds its own in-memory SQLite database via `SetupVerificationDB`,
+    // ensuring a completely isolated, deterministic environment.  This makes
+    // the engine self-contained and eliminates the previous dependency on a
+    // PostgreSQL-specific pgxpool which was not suitable for SQLite.
 
-	e.running = true
-	e.stopCh = make(chan struct{})
+    e.running = true
+    e.stopCh = make(chan struct{})
 
-	for i := 0; i < e.workerCount; i++ {
-		e.wg.Add(1)
-		go e.worker(i)
-	}
+    for i := 0; i < e.workerCount; i++ {
+        e.wg.Add(1)
+        go e.worker(i)
+    }
 
-	log.Info("replay engine started", "workers", e.workerCount)
-	return nil
+    log.Info("replay engine started", "workers", e.workerCount)
+    return nil
 }
 
 // Stop halts the verification worker pool
@@ -107,11 +107,7 @@ func (e *Engine) Stop() {
 
 	close(e.stopCh)
 	e.wg.Wait()
-	
-	if e.dbPool != nil {
-		e.dbPool.Close()
-	}
-	
+
 	e.running = false
 
 	log.Info("replay engine stopped")
@@ -173,109 +169,100 @@ func (e *Engine) worker(id int) {
 
 // processJob performs the verification process for a single job
 func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) types.VerificationResult {
-	startTime := time.Now()
-	
-	result := types.VerificationResult{
-		TxID:              job.TxID,
-		Query:             job.Query,
-		Timestamp:         startTime,
-		PreRootCaptured:   job.PreRootCaptured,
-		PostRootClaimed:   job.PostRootClaimed,
-		PostRootCalculated: "",
-		Success:           false,
-	}
+    startTime := time.Now()
 
-	// Acquire a connection from the pool
-	conn, err := e.dbPool.Acquire(ctx)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to acquire connection: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
-	}
-	defer conn.Release()
+    result := types.VerificationResult{
+        TxID:              job.TxID,
+        Query:             job.Query,
+        Timestamp:         startTime,
+        PreRootCaptured:   job.PreRootCaptured,
+        PostRootClaimed:   job.PostRootClaimed,
+        Success:           false,
+    }
 
-	// Begin a transaction for verification
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to begin transaction: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
-	}
-	// Use defer for transaction rollback as a safety net
-	// This ensures the transaction is rolled back if not explicitly committed
-	defer tx.Rollback(ctx)
+    // Determine which SQL string we should execute (historical jobs stored the
+    // statement in either `SQL` or the older `Query` field).
+    sqlToExecute := job.SQL
+    if sqlToExecute == "" {
+        sqlToExecute = job.Query
+    }
 
-	// Set up deterministic session parameters
-	err = SetDeterministicSessionParamsWithPgx(ctx, tx)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to set deterministic session params: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
-	}
+    // ---------------------------------------------------------------------
+    // Build an isolated in-memory SQLite database that represents the
+    // transaction's pre-state.  This guarantees deterministic, side-effect-
+    // free verification without any external dependencies.
+    // ---------------------------------------------------------------------
 
-	// Set up temporary verification database
-	err = SetupVerificationDBWithPgx(ctx, tx, job.TableSchemas, job.PreStateData)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to set up verification DB: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
-	}
+    verificationDB, err := SetupVerificationDB(ctx, job.TableSchemas, job.PreStateData)
+    if err != nil {
+        result.Error = fmt.Sprintf("failed to set up verification DB: %v", err)
+        result.Duration = time.Since(startTime)
+        return result
+    }
+    // Always close – the DB only lives for the duration of the verification.
+    defer verificationDB.Close()
 
-	// Parse the SQL query to get required info for state capture
-	queryInfo, err := interceptor.AnalyzeQuery(job.SQL)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to analyze query: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
-	}
-	
-	// Store query info for metrics collection
-	result.QueryInfo = queryInfo
+    // ------------------------------------------------------------------
+    // Parse the SQL so we know which tables / rows to capture afterwards.
+    // ------------------------------------------------------------------
+    queryInfo, err := interceptor.AnalyzeQuery(sqlToExecute)
+    if err != nil {
+        result.Error = fmt.Sprintf("failed to analyze query: %v", err)
+        result.Duration = time.Since(startTime)
+        return result
+    }
+    result.QueryInfo = queryInfo
 
-	// Execute query deterministically with the stored arguments
-	err = ExecuteQueriesDeterministicallyWithPgx(ctx, tx, job.SQL, job.Args...)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to execute query: %v", err)
-		result.Duration = time.Since(startTime)
-		return result
-	}
+    // ------------------------------------------------------------------
+    // Execute the SQL deterministically inside a single transaction.
+    // ------------------------------------------------------------------
+    tx, err := ExecuteQueriesDeterministically(ctx, verificationDB, sqlToExecute, job.Args...)
+    if err != nil {
+        result.Error = fmt.Sprintf("failed to execute query: %v", err)
+        result.Duration = time.Since(startTime)
+        return result
+    }
+    // Rollback the tx in case we exit early; commit explicitly when we're
+    // finished so that constraints are fully applied for the post-state read.
+    defer tx.Rollback()
 
-	// Create a mock sql.Result implementation for capture
-	mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
-	
-	// CRITICAL FIX: Capture post-state using pgx within the SAME transaction
-	// BEFORE any commit or rollback
-	postState, postRoot, err := capture.CapturePostStateWithPgx(ctx, queryInfo, tx, mockResult, job.PreStateData, job.TableSchemas)
-	if err != nil {
-		result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
-		result.Duration = time.Since(startTime)
-		// No need to explicitly rollback here as it's handled by defer
-		return result
-	}
+    // ------------------------------------------------------------------
+    // Capture the resulting post-state while still inside the same tx.
+    // ------------------------------------------------------------------
+    mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
 
-	// Fill in the calculated post-state root commitment
-	result.PostRootCalculated = postRoot
-	
-	// Compare roots
-	if postRoot != job.PostRootClaimed {
-		log.Warn("post-state root mismatch", 
-			"calculated", postRoot, 
-			"claimed", job.PostRootClaimed)
-		
-		// Find specific mismatches
-		mismatches := findMismatches(job.PostStateData, postState)
-		result.Mismatches = mismatches
-		
-		log.Warn("verification failed", "tx_id", job.TxID, "mismatches_count", len(mismatches))
-		result.Duration = time.Since(startTime)
-		return result
-	}
-	
-	// Mark success and return
-	result.Success = true
-	log.Info("verification succeeded", "tx_id", job.TxID)
-	result.Duration = time.Since(startTime)
-	return result
+    postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas)
+    if err != nil {
+        result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
+        result.Duration = time.Since(startTime)
+        return result
+    }
+
+    if err := tx.Commit(); err != nil {
+        result.Error = fmt.Sprintf("failed to commit verification tx: %v", err)
+        result.Duration = time.Since(startTime)
+        return result
+    }
+
+    // ------------------------------------------------------------------
+    // Compare the calculated root with the claimed one and build the result.
+    // ------------------------------------------------------------------
+
+    result.PostRootCalculated = postRoot
+
+    if postRoot != job.PostRootClaimed {
+        log.Warn("post-state root mismatch", "calculated", postRoot, "claimed", job.PostRootClaimed)
+
+        mismatches := findMismatches(job.PostStateData, postState)
+        result.Mismatches = mismatches
+
+        result.Duration = time.Since(startTime)
+        return result // success=false by default
+    }
+
+    result.Success = true
+    result.Duration = time.Since(startTime)
+    return result
 }
 
 // parseQueryForCapture converts a SQL query string to QueryInfo for the capture process
