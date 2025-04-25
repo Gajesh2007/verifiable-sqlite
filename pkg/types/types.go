@@ -61,6 +61,13 @@ type QueryInfo struct {
 	NonDeterministic bool            `json:"non_deterministic"`
 }
 
+// ArgPlaceholder represents a positional placeholder ("?") in a SQL statement
+// captured during query analysis.  The Index corresponds to the element in the
+// args slice that will be supplied at execution time.
+type ArgPlaceholder struct {
+    Index int
+}
+
 // StateCommitmentRecord represents a record of a state transition with cryptographic commitments
 type StateCommitmentRecord struct {
 	TxID            string    `json:"tx_id"`

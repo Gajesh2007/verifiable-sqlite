@@ -35,17 +35,19 @@ func GenerateRowID(tableName string, row map[string]types.Value, pkColumns []str
 		}
 	}
 
-	// Serialize the PK values to JSON
-	pkJSON, err := json.Marshal(pkValues)
-	if err != nil {
-		// Fall back to a simple concatenation if JSON fails
-		var concat string
-		for _, col := range pkColumns {
-			if val, ok := row[col]; ok {
-				concat += fmt.Sprintf("%v|", val)
-			}
+	// Build deterministic byte slice of "colName:serializedValue|" in the
+	// *sorted* pkColumns order – avoids reliance on Go’s json map encoding.
+	var buf []byte
+	for _, col := range pkColumns {
+		valBytes, err := serializeValue(pkValues[col])
+		if err != nil {
+			// If serialization fails we still fall back to fmt.Sprintf to avoid panic.
+			valBytes = []byte(fmt.Sprintf("%v", pkValues[col]))
 		}
-		pkJSON = []byte(concat)
+		buf = append(buf, []byte(col)...)
+		buf = append(buf, ':')
+		buf = append(buf, valBytes...)
+		buf = append(buf, '|')
 	}
 
 	// Hash with domain separation
@@ -53,7 +55,7 @@ func GenerateRowID(tableName string, row map[string]types.Value, pkColumns []str
 	h.Write([]byte(DomainRowID))
 	h.Write([]byte(tableName))
 	h.Write([]byte(":"))
-	h.Write(pkJSON)
+	h.Write(buf)
 
 	return hex.EncodeToString(h.Sum(nil))
 }

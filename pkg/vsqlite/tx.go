@@ -52,7 +52,7 @@ func (tx *Tx) execWithVerification(ctx context.Context, queryInfo types.QueryInf
 	startTime := time.Now()
 
 	// 1. Capture pre-state
-	preState, schemas, preRoot, err := capture.CapturePreStateInTx(ctx, tx.Tx, queryInfo)
+	preState, schemas, preRoot, err := capture.CapturePreStateInTx(ctx, tx.Tx, queryInfo, args)
 	if err != nil {
 		log.Warn("failed to capture pre-state", "tx_id", tx.txID, "error", err)
 		// Continue with execution even if capture fails
@@ -65,7 +65,7 @@ func (tx *Tx) execWithVerification(ctx context.Context, queryInfo types.QueryInf
 	}
 
 	// 3. Capture post-state
-	postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx.Tx, queryInfo, result, preState, schemas)
+	postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx.Tx, queryInfo, result, preState, schemas, args)
 	if err != nil {
 		log.Warn("failed to capture post-state", "tx_id", tx.txID, "error", err)
 		// Continue even if capture fails, just skip verification
@@ -73,6 +73,12 @@ func (tx *Tx) execWithVerification(ctx context.Context, queryInfo types.QueryInf
 
 	// Calculate execution time
 	executionTime := time.Since(startTime).Milliseconds()
+
+	// Record query metrics if collector is available
+	if metricsCollector != nil {
+		opName := queryInfo.Type.String()
+		metricsCollector.RecordQuery(opName, time.Since(startTime).Nanoseconds())
+	}
 
 	// 4. Log state commitment record
 	commitmentRecord := types.StateCommitmentRecord{
@@ -176,6 +182,14 @@ func (tx *Tx) Commit() error {
 			"tx_id", tx.txID,
 			"query_count", len(tx.queries))
 	}
+
+	if metricsCollector != nil {
+		if err == nil {
+			metricsCollector.IncrementTxCommitted()
+		} else {
+			metricsCollector.IncrementTxRolledBack()
+		}
+	}
 	
 	return err
 }
@@ -192,6 +206,10 @@ func (tx *Tx) Rollback() error {
 		log.Info("transaction rolled back",
 			"tx_id", tx.txID,
 			"query_count", len(tx.queries))
+	}
+
+	if metricsCollector != nil {
+		metricsCollector.IncrementTxRolledBack()
 	}
 	
 	return err

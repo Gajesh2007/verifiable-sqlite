@@ -54,6 +54,8 @@ func AnalyzeQuery(sql string) (types.QueryInfo, error) {
 
 // extractInfoFromAST extracts information from the parsed SQL AST
 func extractInfoFromAST(info *types.QueryInfo, stmt sqlparser.Statement) {
+    // placeholder index counter increments every time we visit a ValArg '?'.
+    argCounter := 0
 	switch stmt := stmt.(type) {
 	case *sqlparser.Select:
 		info.Type = types.QueryTypeSelect
@@ -72,9 +74,9 @@ func extractInfoFromAST(info *types.QueryInfo, stmt sqlparser.Statement) {
 			info.Tables = append(info.Tables, tableName)
 			
 			// Extract primary key values from WHERE clause
-			if stmt.Where != nil {
-				extractPKValuesFromWhere(info, tableName, stmt.Where.Expr)
-			}
+				if stmt.Where != nil {
+					extractPKValuesFromWhere(info, tableName, stmt.Where.Expr, &argCounter)
+				}
 		}
 	
 	case *sqlparser.Delete:
@@ -85,9 +87,9 @@ func extractInfoFromAST(info *types.QueryInfo, stmt sqlparser.Statement) {
 			info.Tables = append(info.Tables, tableName)
 			
 			// Extract primary key values from WHERE clause
-			if stmt.Where != nil {
-				extractPKValuesFromWhere(info, tableName, stmt.Where.Expr)
-			}
+				if stmt.Where != nil {
+					extractPKValuesFromWhere(info, tableName, stmt.Where.Expr, &argCounter)
+				}
 		}
 	
 	default:
@@ -153,14 +155,14 @@ func extractTableNameFromTableExpr(tableExpr sqlparser.SQLNode) string {
 }
 
 // extractPKValuesFromWhere extracts potential primary key values from a WHERE clause
-func extractPKValuesFromWhere(info *types.QueryInfo, tableName string, expr sqlparser.Expr) {
+func extractPKValuesFromWhere(info *types.QueryInfo, tableName string, expr sqlparser.Expr, argCounter *int) {
 	switch expr := expr.(type) {
 	case *sqlparser.ComparisonExpr:
 		// Check for column = value or column = ?
 		if expr.Operator == "=" {
 			colName := extractColumnName(expr.Left)
 			if colName != "" {
-				value := extractExprValue(expr.Right)
+					value := extractExprValue(expr.Right, argCounter)
 				// Initialize PKColumns and PKValues maps if needed
 				if info.PKColumns[tableName] == nil {
 					info.PKColumns[tableName] = []string{}
@@ -176,12 +178,12 @@ func extractPKValuesFromWhere(info *types.QueryInfo, tableName string, expr sqlp
 	
 	case *sqlparser.AndExpr:
 		// Recursively extract from left and right of AND
-		extractPKValuesFromWhere(info, tableName, expr.Left)
-		extractPKValuesFromWhere(info, tableName, expr.Right)
+			extractPKValuesFromWhere(info, tableName, expr.Left, argCounter)
+			extractPKValuesFromWhere(info, tableName, expr.Right, argCounter)
 	
 	case *sqlparser.ParenExpr:
 		// Recursively extract from parenthesized expression
-		extractPKValuesFromWhere(info, tableName, expr.Expr)
+			extractPKValuesFromWhere(info, tableName, expr.Expr, argCounter)
 	
 	// Other expression types like OR, IN, etc. not handled for PK extraction in V1
 	// Can be extended in future versions
@@ -198,23 +200,24 @@ func extractColumnName(expr sqlparser.Expr) string {
 }
 
 // extractExprValue extracts a value from an expression
-func extractExprValue(expr sqlparser.Expr) types.Value {
-	switch expr := expr.(type) {
-	case *sqlparser.SQLVal:
-		// Convert the value based on its type
-		switch expr.Type {
-		case sqlparser.StrVal:
-			return string(expr.Val)
-		case sqlparser.IntVal:
-			return string(expr.Val) // Keep as string for simplicity in V1
-		case sqlparser.FloatVal:
-			return string(expr.Val)
-		case sqlparser.ValArg:
-			// For prepared statements with ? placeholders
-			return "?" // Using ? as a placeholder marker
-		}
-	}
-	return nil
+func extractExprValue(expr sqlparser.Expr, argCounter *int) types.Value {
+    switch expr := expr.(type) {
+    case *sqlparser.SQLVal:
+        switch expr.Type {
+        case sqlparser.StrVal:
+            return string(expr.Val)
+        case sqlparser.IntVal:
+            return string(expr.Val)
+        case sqlparser.FloatVal:
+            return string(expr.Val)
+        case sqlparser.ValArg:
+            // '?' placeholder – record index and increment counter
+            idx := *argCounter
+            *argCounter = *argCounter + 1
+            return types.ArgPlaceholder{Index: idx}
+        }
+    }
+    return nil
 }
 
 // fallbackBasicAnalysis provides a basic SQL analysis when AST parsing fails

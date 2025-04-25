@@ -231,21 +231,17 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
     // ------------------------------------------------------------------
     mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
 
-    postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas)
+    postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas, job.Args)
     if err != nil {
         result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
         result.Duration = time.Since(startTime)
         return result
     }
 
-    if err := tx.Commit(); err != nil {
-        result.Error = fmt.Sprintf("failed to commit verification tx: %v", err)
-        result.Duration = time.Since(startTime)
-        return result
-    }
-
     // ------------------------------------------------------------------
-    // Compare the calculated root with the claimed one and build the result.
+    // We intentionally ROLLBACK (via the deferred call) after capturing the
+    // post-state.  Committing here would make the temp DB persist beyond the
+    // verification scope and is **not** required for deterministic replay.
     // ------------------------------------------------------------------
 
     result.PostRootCalculated = postRoot

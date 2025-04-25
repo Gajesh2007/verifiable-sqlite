@@ -115,7 +115,7 @@ func getTableSchema(ctx context.Context, executor types.DBExecutor, tableName st
 }
 
 // CapturePreStateInTx captures the state of affected rows before executing a query
-func CapturePreStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryInfo) (map[string][]types.Row, map[string]types.TableSchema, string, error) {
+func CapturePreStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryInfo, args []interface{}) (map[string][]types.Row, map[string]types.TableSchema, string, error) {
 	if len(queryInfo.Tables) == 0 {
 		return nil, nil, "", fmt.Errorf("no tables identified in query")
 	}
@@ -152,7 +152,7 @@ func CapturePreStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryI
 
 			if hasPKs && len(pkValues) > 0 {
 				// We have PK values from the WHERE clause, so we can capture specific rows
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues)
+				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
 					return nil, nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
 				}
@@ -193,7 +193,7 @@ func CapturePreStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryI
 }
 
 // CapturePostStateInTx captures the state of affected rows after executing a query
-func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryInfo, result sql.Result, preState map[string][]types.Row, schemas map[string]types.TableSchema) (map[string][]types.Row, string, error) {
+func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryInfo, result sql.Result, preState map[string][]types.Row, schemas map[string]types.TableSchema, args []interface{}) (map[string][]types.Row, string, error) {
 	if len(queryInfo.Tables) == 0 {
 		return nil, "", fmt.Errorf("no tables identified in query")
 	}
@@ -229,7 +229,7 @@ func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.Query
 				}
 				rows = capturedRows
 			} else {
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, []types.Value{lastID})
+				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, []types.Value{lastID}, args)
 				if err != nil {
 					return nil, "", fmt.Errorf("failed to capture row by ID for table %s: %v", tableName, err)
 				}
@@ -242,7 +242,7 @@ func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.Query
 
 			if hasPKs && len(pkValues) > 0 {
 				// We have PK values from the WHERE clause
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues)
+				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
 					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
 				}
@@ -267,7 +267,7 @@ func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.Query
 
 			if hasPKs && len(pkValues) > 0 {
 				// We have PK values from the WHERE clause
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues)
+				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
 					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
 				}
@@ -310,7 +310,7 @@ func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.Query
 }
 
 // CapturePostStateWithPgx captures the state of affected rows after executing a query using pgx
-func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx pgx.Tx, result sql.Result, preState map[string][]types.Row, schemas map[string]types.TableSchema) (map[string][]types.Row, string, error) {
+func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx pgx.Tx, result sql.Result, preState map[string][]types.Row, schemas map[string]types.TableSchema, args []interface{}) (map[string][]types.Row, string, error) {
 	if len(queryInfo.Tables) == 0 {
 		return nil, "", fmt.Errorf("no tables identified in query")
 	}
@@ -346,7 +346,7 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 				}
 				rows = capturedRows
 			} else {
-				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, []types.Value{lastID})
+				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, []types.Value{lastID}, args)
 				if err != nil {
 					return nil, "", fmt.Errorf("failed to capture row by ID for table %s: %v", tableName, err)
 				}
@@ -359,7 +359,7 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 
 			if hasPKs && len(pkValues) > 0 {
 				// We have PK values from the WHERE clause
-				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, pkValues)
+				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
 					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
 				}
@@ -379,7 +379,7 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 			pkValues, hasPKs := queryInfo.PKValues[tableName]
 
 			if hasPKs && len(pkValues) > 0 {
-				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, pkValues)
+				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
 					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
 				}
@@ -418,7 +418,7 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 }
 
 // captureRowsByPK captures specific rows based on primary key values
-func captureRowsByPK(ctx context.Context, tx *sql.Tx, tableName string, schema types.TableSchema, pkValues []types.Value) ([]types.Row, error) {
+func captureRowsByPK(ctx context.Context, tx *sql.Tx, tableName string, schema types.TableSchema, pkValues []types.Value, queryArgs []interface{}) ([]types.Row, error) {
 	// Build the query to select rows by primary key
 	var rows []types.Row
 
@@ -445,14 +445,22 @@ func captureRowsByPK(ctx context.Context, tx *sql.Tx, tableName string, schema t
 	query := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
 		tableName, pkColumn, strings.Join(placeholders, ","))
 
-	// Convert pkValues to []interface{} for QueryContext
-	args := make([]interface{}, len(pkValues))
+	// Convert pkValues (resolving placeholders) into []interface{} for QueryContext
+	resolvedArgs := make([]interface{}, len(pkValues))
 	for i, v := range pkValues {
-		args[i] = v
+		if ph, ok := v.(types.ArgPlaceholder); ok {
+			if ph.Index < len(queryArgs) {
+				resolvedArgs[i] = queryArgs[ph.Index]
+			} else {
+				resolvedArgs[i] = nil // placeholder index out of range – treat as nil
+			}
+		} else {
+			resolvedArgs[i] = v
+		}
 	}
 
 	// Execute the query
-	resultRows, err := tx.QueryContext(ctx, query, args...)
+	resultRows, err := tx.QueryContext(ctx, query, resolvedArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +561,7 @@ func captureAllRows(ctx context.Context, tx *sql.Tx, tableName string, schema ty
 }
 
 // captureRowsByPKWithPgx captures specific rows based on primary key values using pgx
-func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, schema types.TableSchema, pkValues []types.Value) ([]types.Row, error) {
+func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, schema types.TableSchema, pkValues []types.Value, queryArgs []interface{}) ([]types.Row, error) {
 	var rows []types.Row
 
 	// Build column list for SELECT
@@ -571,14 +579,22 @@ func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sc
 	// Determine which PK column to use
 	primaryKey := schema.PrimaryKey[0] // For V1, we're using the first PK column for simplicity
 
-	// Build the WHERE clause for the primary key values
-	whereConditions := make([]string, len(pkValues))
-	args := make([]interface{}, len(pkValues))
+    // Build the WHERE clause for the primary key values
+    whereConditions := make([]string, len(pkValues))
+    resolvedArgs := make([]interface{}, len(pkValues))
 
-	for i, val := range pkValues {
-		whereConditions[i] = fmt.Sprintf("\"%s\" = $%d", primaryKey, i+1)
-		args[i] = val
-	}
+    for i, val := range pkValues {
+        whereConditions[i] = fmt.Sprintf("\"%s\" = $%d", primaryKey, i+1)
+        if ph, ok := val.(types.ArgPlaceholder); ok {
+            if ph.Index < len(queryArgs) {
+                resolvedArgs[i] = queryArgs[ph.Index]
+            } else {
+                resolvedArgs[i] = nil
+            }
+        } else {
+            resolvedArgs[i] = val
+        }
+    }
 
 	// Build the complete query
 	query := fmt.Sprintf("SELECT %s FROM \"%s\" WHERE %s",
@@ -587,7 +603,7 @@ func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sc
 		strings.Join(whereConditions, " OR "))
 
 	// Execute the query
-	pgxRows, err := tx.Query(ctx, query, args...)
+    pgxRows, err := tx.Query(ctx, query, resolvedArgs...)
 	if err != nil {
 		return nil, err
 	}

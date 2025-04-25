@@ -81,7 +81,7 @@ func createTable(ctx context.Context, db *sql.DB, schema types.TableSchema) erro
 	var columns []string
 	
 	for _, col := range schema.Columns {
-		colDef := fmt.Sprintf("%s %s", col.Name, col.Type)
+		colDef := fmt.Sprintf("\"%s\" %s", col.Name, col.Type)
 		
 		if col.NotNull {
 			colDef += " NOT NULL"
@@ -96,10 +96,15 @@ func createTable(ctx context.Context, db *sql.DB, schema types.TableSchema) erro
 	
 	// If there's a multi-column primary key, add it as a constraint
 	if len(schema.PrimaryKey) > 1 {
-		columns = append(columns, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(schema.PrimaryKey, ", ")))
+		// Quote each pk col
+		quoted := make([]string, len(schema.PrimaryKey))
+		for i, c := range schema.PrimaryKey {
+			quoted[i] = fmt.Sprintf("\"%s\"", c)
+		}
+		columns = append(columns, fmt.Sprintf("PRIMARY KEY (%s)", strings.Join(quoted, ", ")))
 	}
 	
-	createSQL := fmt.Sprintf("CREATE TABLE %s (%s)", schema.Name, strings.Join(columns, ", "))
+	createSQL := fmt.Sprintf("CREATE TABLE \"%s\" (%s)", schema.Name, strings.Join(columns, ", "))
 	
 	// Execute the CREATE TABLE
 	_, err := db.ExecContext(ctx, createSQL)
@@ -161,7 +166,7 @@ func populateTable(ctx context.Context, db *sql.DB, schema types.TableSchema, ro
 	// Prepare column names for INSERT
 	var columnNames []string
 	for _, col := range schema.Columns {
-		columnNames = append(columnNames, col.Name)
+		columnNames = append(columnNames, fmt.Sprintf("\"%s\"", col.Name))
 	}
 	
 	// Create placeholders for prepared statement
@@ -171,8 +176,8 @@ func populateTable(ctx context.Context, db *sql.DB, schema types.TableSchema, ro
 	}
 	
 	// Prepare the INSERT statement
-	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
-		schema.Name, 
+	insertSQL := fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES (%s)",
+		schema.Name,
 		strings.Join(columnNames, ", "),
 		strings.Join(placeholders, ", "))
 	

@@ -44,6 +44,11 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 		return nil, err
 	}
 
+	// Metrics: transaction started
+	if metricsCollector != nil {
+		metricsCollector.IncrementTxStarted()
+	}
+
 	// Create a transaction ID for tracking
 	txID := fmt.Sprintf("tx-%d", time.Now().UnixNano())
 	
