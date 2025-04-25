@@ -1,0 +1,30 @@
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/vendor/
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Binary builds
+/example_app
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+example_app
+example.db
