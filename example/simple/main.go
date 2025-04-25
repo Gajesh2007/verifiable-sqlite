@@ -14,7 +14,7 @@ import (
 
 func main() {
 	// Remove example database if it exists
-	os.Remove("./example.db")
+	os.Remove("./simple_example.db")
 
 	// Initialize VSQLite with verification enabled
 	cfg := config.DefaultConfig()
@@ -22,7 +22,7 @@ func main() {
 	defer vsqlite.Shutdown()
 
 	// Open database
-	db, err := vsqlite.Open("sqlite3", "./example.db")
+	db, err := vsqlite.Open("sqlite3", "./simple_example.db")
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
@@ -46,44 +46,57 @@ func main() {
 		log.Fatalf("Failed to begin transaction: %v", err)
 	}
 
-	// Insert data
+	// Insert a user
 	now := time.Now().Format(time.RFC3339)
-	result, err := tx.Exec("INSERT INTO users (name, email, created_at) VALUES (?, ?, ?)",
-		"John Doe", "john@example.com", now)
+	result, err := tx.Exec(
+		"INSERT INTO users (name, email, created_at) VALUES (?, ?, ?)",
+		"John Doe", "john@example.com", now,
+	)
 	if err != nil {
-		tx.Rollback()
-		log.Fatalf("Failed to insert data: %v", err)
+		log.Fatalf("Failed to insert: %v", err)
 	}
 
-	id, _ := result.LastInsertId()
+	// Get last insert ID
+	id, err := result.LastInsertId()
+	if err != nil {
+		log.Fatalf("Failed to get last insert ID: %v", err)
+	}
 	fmt.Printf("Inserted user with ID: %d\n", id)
-
-	// Update data
-	_, err = tx.Exec("UPDATE users SET name = ? WHERE id = ?", "John Smith", id)
-	if err != nil {
-		tx.Rollback()
-		log.Fatalf("Failed to update data: %v", err)
-	}
 
 	// Commit the transaction
 	if err := tx.Commit(); err != nil {
 		log.Fatalf("Failed to commit transaction: %v", err)
 	}
-	fmt.Println("Transaction committed successfully")
 
-	// Query the data
+	// Update the user in a new transaction
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	_, err = tx.Exec("UPDATE users SET name = ? WHERE id = ?", "Jane Doe", id)
+	if err != nil {
+		log.Fatalf("Failed to update: %v", err)
+	}
+
+	// Commit the update
+	if err := tx.Commit(); err != nil {
+		log.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Verify data was updated
 	var name string
 	err = db.QueryRow("SELECT name FROM users WHERE id = ?", id).Scan(&name)
 	if err != nil {
-		log.Fatalf("Failed to query data: %v", err)
+		log.Fatalf("Failed to query: %v", err)
 	}
 	fmt.Printf("Updated name: %s\n", name)
 
 	// Clean up - comment this out if you want to inspect the DB file
-	// os.Remove("./example.db")
+	// os.Remove("./simple_example.db")
 
 	// Wait for async verification to complete
 	fmt.Println("Waiting for async verification to complete...")
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	fmt.Println("Done.")
 }

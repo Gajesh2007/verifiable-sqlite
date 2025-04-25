@@ -43,6 +43,7 @@ const (
 	QueryTypeInsert  QueryType = "INSERT"
 	QueryTypeUpdate  QueryType = "UPDATE"
 	QueryTypeDelete  QueryType = "DELETE"
+	QueryTypeOther   QueryType = "OTHER"    // For DDL, PRAGMA, etc.
 )
 
 // String returns the string representation of QueryType
@@ -95,6 +96,8 @@ type VerificationResult struct {
 	PostRootCalculated string   `json:"post_root_calculated"`
 	Error             string    `json:"error,omitempty"`
 	Mismatches        []string  `json:"mismatches,omitempty"`
+	Duration          time.Duration `json:"duration"`
+	QueryInfo         QueryInfo `json:"query_info,omitempty"`
 }
 
 // DBExecutor is an interface that can execute database queries

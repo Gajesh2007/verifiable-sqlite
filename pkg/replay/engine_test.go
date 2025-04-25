@@ -1,9 +1,7 @@
 package replay
 
 import (
-	"context"
 	"testing"
-	"time"
 
 	"github.com/gaj/verifiable-sqlite/pkg/config"
 	"github.com/gaj/verifiable-sqlite/pkg/types"

@@ -26,9 +26,11 @@ func SetupDefault() {
 
 // SetupWithWriter sets up the logger with a custom writer
 func SetupWithWriter(w io.Writer) {
-	logger = slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
+	loggerOnce.Do(func() {
+		logger = slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		}))
+	})
 }
 
 // Debug logs a debug message

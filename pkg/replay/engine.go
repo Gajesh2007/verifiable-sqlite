@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +11,9 @@ import (
 	"github.com/gaj/verifiable-sqlite/pkg/config"
 	"github.com/gaj/verifiable-sqlite/pkg/interceptor"
 	"github.com/gaj/verifiable-sqlite/pkg/log"
+	"github.com/gaj/verifiable-sqlite/pkg/metrics"
 	"github.com/gaj/verifiable-sqlite/pkg/types"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Ensure we use sql package
@@ -43,6 +44,8 @@ type Engine struct {
 	running     bool
 	mu          sync.Mutex
 	config      config.Config
+	dbPool      *pgxpool.Pool
+	metrics     *metrics.Metrics // Metrics collector for observability
 }
 
 // NewEngine creates a new replay engine
@@ -52,16 +55,33 @@ func NewEngine(cfg config.Config) *Engine {
 		workerCount: cfg.WorkerCount,
 		stopCh:      make(chan struct{}),
 		config:      cfg,
+		// Initialize metrics inline for standalone use, but can be overridden with SetMetrics
+		metrics:     nil,
 	}
 }
 
+// SetMetrics sets the metrics collector for the engine
+// This allows the vsqlite package to inject a shared metrics collector
+func (e *Engine) SetMetrics(m *metrics.Metrics) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.metrics = m
+}
+
 // Start begins the verification worker pool
-func (e *Engine) Start() {
+func (e *Engine) Start() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.running {
-		return
+		return nil
+	}
+
+	// Create a connection pool for SQLite verification
+	var err error
+	e.dbPool, err = pgxpool.New(context.Background(), "sqlite://:memory:")
+	if err != nil {
+		return fmt.Errorf("failed to create connection pool: %v", err)
 	}
 
 	e.running = true
@@ -73,6 +93,7 @@ func (e *Engine) Start() {
 	}
 
 	log.Info("replay engine started", "workers", e.workerCount)
+	return nil
 }
 
 // Stop halts the verification worker pool
@@ -86,6 +107,11 @@ func (e *Engine) Stop() {
 
 	close(e.stopCh)
 	e.wg.Wait()
+	
+	if e.dbPool != nil {
+		e.dbPool.Close()
+	}
+	
 	e.running = false
 
 	log.Info("replay engine stopped")
@@ -115,25 +141,30 @@ func (e *Engine) SubmitJob(job types.VerificationJob) error {
 func (e *Engine) worker(id int) {
 	defer e.wg.Done()
 
-	log.Debug("worker started", "worker_id", id)
+	log.Debug("verification worker started", "worker_id", id)
 
 	for {
 		select {
 		case <-e.stopCh:
-			log.Debug("worker stopping", "worker_id", id)
+			log.Debug("verification worker stopping", "worker_id", id)
 			return
 		case job := <-e.jobQueue:
-			log.Debug("worker processing job", "worker_id", id, "tx_id", job.TxID)
-			
-			// Create timeout context
-			ctx, cancel := context.WithTimeout(context.Background(), 
-				time.Duration(e.config.VerificationTimeoutMs)*time.Millisecond)
+			// Create a context with timeout
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				time.Duration(e.config.VerificationTimeoutMs)*time.Millisecond,
+			)
 			
 			// Process the job
 			result := e.processJob(ctx, job)
 			
 			// Log the result
 			log.LogVerificationResult(result)
+			
+			// Update metrics if available
+			if e.metrics != nil {
+				e.metrics.Update(result)
+			}
 			
 			cancel()
 		}
@@ -142,158 +173,226 @@ func (e *Engine) worker(id int) {
 
 // processJob performs the verification process for a single job
 func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) types.VerificationResult {
+	startTime := time.Now()
+	
 	result := types.VerificationResult{
 		TxID:              job.TxID,
 		Query:             job.Query,
-		Timestamp:         time.Now(),
+		Timestamp:         startTime,
 		PreRootCaptured:   job.PreRootCaptured,
 		PostRootClaimed:   job.PostRootClaimed,
 		PostRootCalculated: "",
 		Success:           false,
 	}
 
+	// Acquire a connection from the pool
+	conn, err := e.dbPool.Acquire(ctx)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to acquire connection: %v", err)
+		result.Duration = time.Since(startTime)
+		return result
+	}
+	defer conn.Release()
+
+	// Begin a transaction for verification
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to begin transaction: %v", err)
+		result.Duration = time.Since(startTime)
+		return result
+	}
+	// Use defer for transaction rollback as a safety net
+	// This ensures the transaction is rolled back if not explicitly committed
+	defer tx.Rollback(ctx)
+
+	// Set up deterministic session parameters
+	err = SetDeterministicSessionParamsWithPgx(ctx, tx)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to set deterministic session params: %v", err)
+		result.Duration = time.Since(startTime)
+		return result
+	}
+
 	// Set up temporary verification database
-	db, err := SetupVerificationDB(ctx, job.TableSchemas, job.PreStateData)
+	err = SetupVerificationDBWithPgx(ctx, tx, job.TableSchemas, job.PreStateData)
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to set up verification DB: %v", err)
+		result.Duration = time.Since(startTime)
 		return result
 	}
-	defer db.Close()
+
+	// Parse the SQL query to get required info for state capture
+	queryInfo, err := interceptor.AnalyzeQuery(job.SQL)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed to analyze query: %v", err)
+		result.Duration = time.Since(startTime)
+		return result
+	}
+	
+	// Store query info for metrics collection
+	result.QueryInfo = queryInfo
 
 	// Execute query deterministically with the stored arguments
-	tx, execErr := ExecuteQueriesDeterministically(ctx, db, job.SQL, job.Args...)
-	if execErr != nil {
-		result.Error = fmt.Sprintf("failed to execute query: %v", execErr)
-		return result
-	}
-
-	// Capture post-state using the same capture logic
-	queryInfo, err := parseQueryForCapture(job.SQL)
+	err = ExecuteQueriesDeterministicallyWithPgx(ctx, tx, job.SQL, job.Args...)
 	if err != nil {
-		result.Error = fmt.Sprintf("failed to parse query for capture: %v", err)
-		tx.Rollback()
+		result.Error = fmt.Sprintf("failed to execute query: %v", err)
+		result.Duration = time.Since(startTime)
 		return result
 	}
 
-	// Create a mock sql.Result implementation
+	// Create a mock sql.Result implementation for capture
 	mockResult := &MockSQLResult{lastID: 1, rowsAffected: 1}
 	
-	// Capture post-state
-	postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas)
+	// CRITICAL FIX: Capture post-state using pgx within the SAME transaction
+	// BEFORE any commit or rollback
+	postState, postRoot, err := capture.CapturePostStateWithPgx(ctx, queryInfo, tx, mockResult, job.PreStateData, job.TableSchemas)
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
-		tx.Rollback()
+		result.Duration = time.Since(startTime)
+		// No need to explicitly rollback here as it's handled by defer
 		return result
 	}
 
-	// Commit the transaction
-	if err := tx.Commit(); err != nil {
-		result.Error = fmt.Sprintf("failed to commit transaction: %v", err)
-		return result
-	}
-
-	// Compare the calculated root with the claimed root
+	// Fill in the calculated post-state root commitment
 	result.PostRootCalculated = postRoot
-	result.Success = (postRoot == job.PostRootClaimed)
-
-	if !result.Success {
-		// Find mismatches
-		result.Mismatches = findMismatches(job.PostStateData, postState)
+	
+	// Compare roots
+	if postRoot != job.PostRootClaimed {
+		log.Warn("post-state root mismatch", 
+			"calculated", postRoot, 
+			"claimed", job.PostRootClaimed)
+		
+		// Find specific mismatches
+		mismatches := findMismatches(job.PostStateData, postState)
+		result.Mismatches = mismatches
+		
+		log.Warn("verification failed", "tx_id", job.TxID, "mismatches_count", len(mismatches))
+		result.Duration = time.Since(startTime)
+		return result
 	}
-
+	
+	// Mark success and return
+	result.Success = true
+	log.Info("verification succeeded", "tx_id", job.TxID)
+	result.Duration = time.Since(startTime)
 	return result
 }
 
 // parseQueryForCapture converts a SQL query string to QueryInfo for the capture process
 // This reuses the actual interceptor to ensure consistent analysis
 func parseQueryForCapture(query string) (types.QueryInfo, error) {
-	// Use the actual query interceptor to ensure consistent behavior
 	return interceptor.AnalyzeQuery(query)
-}
-
-// determineQueryType is a simple function to determine query type from SQL string
-func determineQueryType(query string) types.QueryType {
-	queryLower := strings.ToLower(query)
-	if strings.HasPrefix(queryLower, "select") {
-		return types.QueryTypeSelect
-	} else if strings.HasPrefix(queryLower, "insert") {
-		return types.QueryTypeInsert
-	} else if strings.HasPrefix(queryLower, "update") {
-		return types.QueryTypeUpdate
-	} else if strings.HasPrefix(queryLower, "delete") {
-		return types.QueryTypeDelete
-	}
-	return types.QueryTypeUnknown
-}
-
-// extractTablesFromQuery extracts table names from a SQL query string
-// This is a simplified version for the replay engine
-func extractTablesFromQuery(query string) []string {
-	// For V1, this is a stub - in a real implementation, we would parse the query
-	// The job already has the tables, so this isn't critical for replay
-	return []string{}
 }
 
 // findMismatches identifies differences between claimed and calculated post-state
 func findMismatches(claimed, calculated map[string][]types.Row) []string {
 	var mismatches []string
-
-	// Compare table by table
-	for tableName, claimedRows := range claimed {
-		calculatedRows, exists := calculated[tableName]
+	
+	// Check if tables match
+	claimedTables := make(map[string]bool)
+	calculatedTables := make(map[string]bool)
+	
+	for table := range claimed {
+		claimedTables[table] = true
+	}
+	
+	for table := range calculated {
+		calculatedTables[table] = true
+	}
+	
+	// Check for missing tables
+	for table := range claimedTables {
+		if !calculatedTables[table] {
+			mismatches = append(mismatches, fmt.Sprintf("table '%s' present in claimed state but missing in calculated state", table))
+		}
+	}
+	
+	for table := range calculatedTables {
+		if !claimedTables[table] {
+			mismatches = append(mismatches, fmt.Sprintf("table '%s' present in calculated state but missing in claimed state", table))
+		}
+	}
+	
+	// Check row counts
+	for table, claimedRows := range claimed {
+		calculatedRows, exists := calculated[table]
 		if !exists {
-			mismatches = append(mismatches, fmt.Sprintf("table %s missing in calculated state", tableName))
+			continue // Already reported as missing
+		}
+		
+		if len(claimedRows) != len(calculatedRows) {
+			mismatches = append(mismatches, fmt.Sprintf("row count mismatch for table '%s': claimed=%d, calculated=%d", 
+				table, len(claimedRows), len(calculatedRows)))
+		}
+	}
+	
+	// Build maps of rows by row ID for easier comparison
+	for table, claimedRows := range claimed {
+		calculatedRows, exists := calculated[table]
+		if !exists {
+			continue // Already reported as missing
+		}
+		
+		// Skip if row counts don't match (already reported)
+		if len(claimedRows) != len(calculatedRows) {
 			continue
 		}
-
-		// Create maps for easier comparison
-		claimedMap := make(map[string]types.Row)
+		
+		// Build maps for comparison
+		claimedRowMap := make(map[string]types.Row)
+		calculatedRowMap := make(map[string]types.Row)
+		
 		for _, row := range claimedRows {
-			claimedMap[row.RowID] = row
+			claimedRowMap[row.RowID] = row
 		}
-
-		calculatedMap := make(map[string]types.Row)
+		
 		for _, row := range calculatedRows {
-			calculatedMap[row.RowID] = row
+			calculatedRowMap[row.RowID] = row
 		}
-
-		// Check for missing or extra rows
-		for rowID := range claimedMap {
-			if _, exists := calculatedMap[rowID]; !exists {
-				mismatches = append(mismatches, fmt.Sprintf("row %s missing in calculated state", rowID))
-			}
-		}
-
-		for rowID := range calculatedMap {
-			if _, exists := claimedMap[rowID]; !exists {
-				mismatches = append(mismatches, fmt.Sprintf("extra row %s in calculated state", rowID))
-			}
-		}
-
-		// Compare common rows
-		for rowID, claimedRow := range claimedMap {
-			calculatedRow, exists := calculatedMap[rowID]
-			if !exists {
-				continue // Already reported as missing
-			}
-
-			// Compare values
-			for colName, claimedVal := range claimedRow.Values {
-				calculatedVal, exists := calculatedRow.Values[colName]
-				if !exists {
-					mismatches = append(mismatches, fmt.Sprintf("column %s missing in row %s", colName, rowID))
+		
+		// Check for missing rows by ID
+		for rowID, claimedRow := range claimedRowMap {
+			if _, exists := calculatedRowMap[rowID]; !exists {
+				mismatches = append(mismatches, fmt.Sprintf("row ID '%s' in table '%s' present in claimed state but missing in calculated state", 
+					rowID, table))
+			} else {
+				// Row exists in both, check if values match
+				calculatedRow := calculatedRowMap[rowID]
+				
+				// Check if column counts match
+				if len(claimedRow.Values) != len(calculatedRow.Values) {
+					mismatches = append(mismatches, fmt.Sprintf("column count mismatch for row ID '%s' in table '%s': claimed=%d, calculated=%d", 
+						rowID, table, len(claimedRow.Values), len(calculatedRow.Values)))
 					continue
 				}
-
-				// Compare values - this is simplified and might need more robust comparison
-				if fmt.Sprintf("%v", claimedVal) != fmt.Sprintf("%v", calculatedVal) {
-					mismatches = append(mismatches, 
-						fmt.Sprintf("value mismatch in row %s, column %s: claimed=%v, calculated=%v", 
-							rowID, colName, claimedVal, calculatedVal))
+				
+				// Check if column values match
+				for col, claimedVal := range claimedRow.Values {
+					calculatedVal, exists := calculatedRow.Values[col]
+					if !exists {
+						mismatches = append(mismatches, fmt.Sprintf("column '%s' for row ID '%s' in table '%s' present in claimed state but missing in calculated state", 
+							col, rowID, table))
+						continue
+					}
+					
+					// Compare values - for V1 we do simple string comparison
+					// In V2 we would need more sophisticated type-aware comparison
+					if fmt.Sprintf("%v", claimedVal) != fmt.Sprintf("%v", calculatedVal) {
+						mismatches = append(mismatches, fmt.Sprintf("value mismatch for column '%s' in row ID '%s' of table '%s': claimed='%v', calculated='%v'", 
+							col, rowID, table, claimedVal, calculatedVal))
+					}
 				}
+			}
+		}
+		
+		// Check for extra rows in calculated state
+		for rowID := range calculatedRowMap {
+			if _, exists := claimedRowMap[rowID]; !exists {
+				mismatches = append(mismatches, fmt.Sprintf("row ID '%s' in table '%s' present in calculated state but missing in claimed state", 
+					rowID, table))
 			}
 		}
 	}
-
+	
 	return mismatches
 }

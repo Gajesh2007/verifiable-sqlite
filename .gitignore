@@ -26,5 +26,12 @@
 .DS_Store
 Thumbs.db
 
+# Example
 example_app
 example.db
+
+# Spec
+TechSpec.md
+
+# Repomix
+repomix-output.xml
