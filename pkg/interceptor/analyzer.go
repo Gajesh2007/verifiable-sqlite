@@ -162,7 +162,7 @@ func extractPKValuesFromWhere(info *types.QueryInfo, tableName string, expr sqlp
 		if expr.Operator == "=" {
 			colName := extractColumnName(expr.Left)
 			if colName != "" {
-					value := extractExprValue(expr.Right, argCounter)
+				value := extractExprValue(expr.Right, argCounter)
 				// Initialize PKColumns and PKValues maps if needed
 				if info.PKColumns[tableName] == nil {
 					info.PKColumns[tableName] = []string{}
@@ -174,19 +174,42 @@ func extractPKValuesFromWhere(info *types.QueryInfo, tableName string, expr sqlp
 				info.PKColumns[tableName] = append(info.PKColumns[tableName], colName)
 				info.PKValues[tableName] = append(info.PKValues[tableName], value)
 			}
+		} else if expr.Operator == "in" {
+			// Handle IN operator (e.g., WHERE id IN (1, 2, 3) or WHERE id IN (?, ?, ?))
+			colName := extractColumnName(expr.Left)
+			if colName != "" {
+				// Extract values from the IN clause tuple
+				switch right := expr.Right.(type) {
+				case sqlparser.ValTuple:
+					// Initialize PKColumns and PKValues maps if needed
+					if info.PKColumns[tableName] == nil {
+						info.PKColumns[tableName] = []string{}
+					}
+					if info.PKValues[tableName] == nil {
+						info.PKValues[tableName] = []types.Value{}
+					}
+					
+					// Add a column name entry for each value in the IN clause
+					for _, valExpr := range right {
+						value := extractExprValue(valExpr, argCounter)
+						info.PKColumns[tableName] = append(info.PKColumns[tableName], colName)
+						info.PKValues[tableName] = append(info.PKValues[tableName], value)
+					}
+				}
+			}
 		}
 	
 	case *sqlparser.AndExpr:
 		// Recursively extract from left and right of AND
-			extractPKValuesFromWhere(info, tableName, expr.Left, argCounter)
-			extractPKValuesFromWhere(info, tableName, expr.Right, argCounter)
+		extractPKValuesFromWhere(info, tableName, expr.Left, argCounter)
+		extractPKValuesFromWhere(info, tableName, expr.Right, argCounter)
 	
 	case *sqlparser.ParenExpr:
 		// Recursively extract from parenthesized expression
-			extractPKValuesFromWhere(info, tableName, expr.Expr, argCounter)
+		extractPKValuesFromWhere(info, tableName, expr.Expr, argCounter)
 	
-	// Other expression types like OR, IN, etc. not handled for PK extraction in V1
-	// Can be extended in future versions
+	// Other expression types like OR, BETWEEN, subqueries, function calls not handled for PK extraction in V1
+	// These limitations are intentional for V1 simplicity
 	}
 }
 

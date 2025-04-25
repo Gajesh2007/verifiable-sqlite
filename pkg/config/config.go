@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Config contains the configuration for Verifiable SQLite
 type Config struct {
 	// Feature flags for enabling/disabling functionality
 	EnableVerification bool `mapstructure:"enable_verification"`
@@ -42,7 +43,33 @@ func DefaultConfig() Config {
 	}
 }
 
+// Validate ensures the configuration values are within valid ranges
+func (c *Config) Validate() error {
+	if c.JobQueueSize <= 0 {
+		return fmt.Errorf("job_queue_size must be positive, got %d", c.JobQueueSize)
+	}
+	
+	if c.WorkerCount <= 0 {
+		return fmt.Errorf("worker_count must be positive, got %d", c.WorkerCount)
+	}
+	
+	if c.VerificationTimeoutMs <= 0 {
+		return fmt.Errorf("verification_timeout_ms must be positive, got %d", c.VerificationTimeoutMs)
+	}
+	
+	if c.MetricsServerEnabled && c.MetricsServerAddr == "" {
+		return fmt.Errorf("metrics_server_addr cannot be empty when metrics_server_enabled is true")
+	}
+	
+	return nil
+}
+
 // Load loads configuration from a configuration file, environment variables, and flags
+// Configuration precedence (highest to lowest):
+// 1. Command line flags (not implemented in this function)
+// 2. Environment variables: VSQLITE_ENABLE_VERIFICATION, etc.
+// 3. Configuration file (YAML, JSON, or TOML)
+// 4. Default values
 func Load() (Config, error) {
 	// Start with the default configuration
 	config := DefaultConfig()
@@ -82,6 +109,11 @@ func Load() (Config, error) {
 	if err := v.Unmarshal(&config); err != nil {
 		return config, fmt.Errorf("unable to decode config: %v", err)
 	}
+	
+	// Validate the configuration
+	if err := config.Validate(); err != nil {
+		return config, fmt.Errorf("invalid configuration: %v", err)
+	}
 
 	return config, nil
 }
@@ -92,24 +124,29 @@ func CreateExampleConfig(path string) error {
 	configContent := `# Verifiable SQLite Configuration
 
 # Feature flags
-enable_verification: true
-enable_warnings: true
-enable_logging: true
+enable_verification: true  # Whether to enable verification
+enable_warnings: true      # Whether to warn about non-deterministic functions
+enable_logging: true       # Whether to enable logging
 
 # Job queue settings
-job_queue_size: 100
-worker_count: 4
-verification_timeout_ms: 5000
+job_queue_size: 100        # Maximum number of verification jobs to queue
+worker_count: 4            # Number of worker goroutines for verification
+verification_timeout_ms: 5000  # Timeout for verification jobs in milliseconds
 
 # Metrics settings
-metrics_server_enabled: false
-metrics_server_addr: ":9090"
+metrics_server_enabled: false  # Whether to enable the metrics server
+metrics_server_addr: ":9090"   # Address for the metrics server (empty for no server)
+
+# V1 Limitations:
+# - SELECT-based state capture (not WAL)
+# - No query rewriting
+# - Internal re-execution only
+# - Verification skipped for tables without PKs
 `
 
-	// Write to file
-	err := os.WriteFile(path, []byte(configContent), 0644)
-	if err != nil {
-		return fmt.Errorf("error writing example config: %v", err)
+	// Write the example config to the specified path
+	if err := os.WriteFile(path, []byte(configContent), 0644); err != nil {
+		return fmt.Errorf("failed to write example config file: %v", err)
 	}
 
 	return nil

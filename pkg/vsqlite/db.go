@@ -30,6 +30,11 @@ func Open(driverName, dataSourceName string) (*DB, error) {
 		return nil, err
 	}
 
+	// Track connection metrics
+	if metricsCollector != nil {
+		metricsCollector.IncrementConnectionOpened()
+	}
+
 	log.Debug("opened connection to SQLite database", "driver", driverName, "dsn", dataSourceName)
 	return &DB{DB: db, dsn: dataSourceName}, nil
 }
@@ -158,5 +163,11 @@ func (db *DB) QueryRowContext(ctx context.Context, query string, args ...interfa
 // Close closes the database connection
 func (db *DB) Close() error {
 	log.Debug("closing database connection")
+	
+	// Track connection metrics
+	if metricsCollector != nil {
+		metricsCollector.IncrementConnectionClosed()
+	}
+
 	return db.DB.Close()
 }

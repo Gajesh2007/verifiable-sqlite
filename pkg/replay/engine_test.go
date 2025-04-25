@@ -20,8 +20,12 @@ func TestVerificationJobSubmission(t *testing.T) {
 		WorkerCount:          1,
 		VerificationTimeoutMs: 1000,
 	}
-	engine := NewEngine(cfg)
-	engine.metrics = metrics.NewMetrics()
+	engine := NewEngine(
+		cfg.JobQueueSize, 
+		cfg.WorkerCount,
+		WithTimeout(time.Duration(cfg.VerificationTimeoutMs) * time.Millisecond),
+	)
+	engine.SetMetrics(metrics.NewMetrics())
 	
 	// Test engine initial state
 	assert.NotNil(t, engine)
@@ -82,7 +86,11 @@ func TestVerificationJobSubmission(t *testing.T) {
 func TestSubmitJobToStoppedEngine(t *testing.T) {
 	// Create a test engine but don't start it
 	cfg := config.DefaultConfig()
-	engine := NewEngine(cfg)
+	engine := NewEngine(
+		cfg.JobQueueSize,
+		cfg.WorkerCount,
+		WithTimeout(time.Duration(cfg.VerificationTimeoutMs) * time.Millisecond),
+	)
 
 	// Create a test job
 	job := types.VerificationJob{
@@ -103,12 +111,14 @@ func TestJobQueueFull(t *testing.T) {
 		WorkerCount:          1,
 		VerificationTimeoutMs: 5000,
 	}
-	engine := NewEngine(cfg)
+	engine := NewEngine(
+		cfg.JobQueueSize,
+		cfg.WorkerCount,
+		WithTimeout(time.Duration(cfg.VerificationTimeoutMs) * time.Millisecond),
+	)
 	// Use a channel that's deliberately slow to process
 	engine.jobQueue = make(chan types.VerificationJob, 1)
-	engine.metrics = metrics.NewMetrics()
-
-	// No external connection pool is required for this test.
+	engine.SetMetrics(metrics.NewMetrics())
 
 	// Start the engine
 	err := engine.Start()

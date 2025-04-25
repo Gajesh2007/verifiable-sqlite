@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/gaj/verifiable-sqlite/pkg/commitment"
+	"github.com/gaj/verifiable-sqlite/pkg/errors"
 	"github.com/gaj/verifiable-sqlite/pkg/log"
 	"github.com/gaj/verifiable-sqlite/pkg/types"
 	"github.com/jackc/pgx/v5"
@@ -37,7 +38,7 @@ func getTableSchemas(ctx context.Context, executor types.DBExecutor, tableNames 
 		// Get table info from SQLite schema
 		schema, err := getTableSchema(ctx, executor, tableName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get schema for table %s: %v", tableName, err)
+			return nil, errors.Wrapf(err, "failed to get schema for table %s", tableName)
 		}
 
 		// Cache the schema
@@ -61,7 +62,7 @@ func getTableSchema(ctx context.Context, executor types.DBExecutor, tableName st
 	// Get column info using pragma_table_info
 	rows, err := executor.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
-		return schema, err
+		return schema, errors.Wrap(err, "failed to get column info")
 	}
 	defer rows.Close()
 
@@ -74,7 +75,7 @@ func getTableSchema(ctx context.Context, executor types.DBExecutor, tableName st
 		var pk int
 
 		if err := rows.Scan(&cid, &name, &typeName, &notNull, &defaultValue, &pk); err != nil {
-			return schema, err
+			return schema, errors.Wrap(err, "failed to scan row")
 		}
 
 		columnInfo := types.ColumnInfo{
@@ -93,95 +94,167 @@ func getTableSchema(ctx context.Context, executor types.DBExecutor, tableName st
 	}
 
 	if err = rows.Err(); err != nil {
-		return schema, err
+		return schema, errors.Wrap(err, "failed to read rows")
 	}
 
 	// If no explicit primary key, look for rowid
 	if len(schema.PrimaryKey) == 0 {
-		// Check if this is a rowid table
+		// First, check if this is a WITHOUT ROWID table
+		withoutRowidQuery, err := executor.QueryContext(ctx, fmt.Sprintf("SELECT sql FROM sqlite_master WHERE type='table' AND name='%s'", tableName))
+		if err == nil {
+			defer withoutRowidQuery.Close()
+			if withoutRowidQuery.Next() {
+				var tableSql string
+				if err := withoutRowidQuery.Scan(&tableSql); err == nil {
+					// If the table was created WITH WITHOUT ROWID, we can't use rowid as a PK
+					if strings.Contains(strings.ToUpper(tableSql), "WITHOUT ROWID") {
+						log.Debug("table created WITHOUT ROWID, skipping rowid as PK", "table", tableName)
+						return schema, nil
+					}
+				}
+			}
+		}
+		
+		// Check if this is a regular rowid table (most SQLite tables are)
+		// pragma_table_xinfo shows hidden columns like rowid
 		rowsQuery, err := executor.QueryContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_xinfo('%s') WHERE name = 'rowid'", tableName))
 		if err == nil {
 			defer rowsQuery.Close()
 			if rowsQuery.Next() {
 				var hasRowid int
 				if err := rowsQuery.Scan(&hasRowid); err == nil && hasRowid > 0 {
+					log.Debug("using implicit rowid as primary key for table without explicit PK", "table", tableName)
 					schema.PrimaryKey = []string{"rowid"}
+					
+					// Add rowid as a column to the schema since it doesn't appear in normal PRAGMA table_info
+					schema.Columns = append(schema.Columns, types.ColumnInfo{
+						Name:       "rowid",
+						Type:       "INTEGER",
+						NotNull:    true,
+						PrimaryKey: true,
+					})
+				} else {
+					log.Warn("table has no primary key and is not a standard rowid table", "table", tableName)
 				}
 			}
+		} else {
+			log.Warn("failed to check rowid status", "table", tableName, "error", err)
 		}
 	}
 
 	return schema, nil
 }
 
-// CapturePreStateInTx captures the state of affected rows before executing a query
+// CapturePreStateInTx captures the state of tables affected by a query before
+// executing the query. It returns the captured state, table schemas, and a
+// Merkle root of the pre-state.
 func CapturePreStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryInfo, args []interface{}) (map[string][]types.Row, map[string]types.TableSchema, string, error) {
+	preState := make(map[string][]types.Row)
+	schemas := make(map[string]types.TableSchema)
+
+	// Extract PK values from the query's WHERE clause to optimize state capture
 	if len(queryInfo.Tables) == 0 {
-		return nil, nil, "", fmt.Errorf("no tables identified in query")
+		log.Debug("no tables affected by query", "sql", queryInfo.SQL)
+		return preState, schemas, "", nil
 	}
 
-	// Get table schemas first
-	schemas, err := getTableSchemas(ctx, tx, queryInfo.Tables)
-	if err != nil {
-		return nil, nil, "", fmt.Errorf("failed to get table schemas: %v", err)
-	}
+	// Synchronization for concurrent schema lookups and state captures
+	var wg sync.WaitGroup
+	schemasMutex := &sync.Mutex{}
+	preStateMutex := &sync.Mutex{}
+	errChan := make(chan error, len(queryInfo.Tables))
 
-	// Capture state for each affected table
-	state := make(map[string][]types.Row)
-	tableRoots := make(map[string]string)
+	for _, table := range queryInfo.Tables {
+		wg.Add(1)
+		go func(tableName string) {
+			defer wg.Done()
 
-	for _, tableName := range queryInfo.Tables {
-		schema := schemas[tableName]
-
-		// Skip tables without a primary key for simplicity in V1
-		if len(schema.PrimaryKey) == 0 {
-			log.Warn("skipping state capture for table without primary key", "table", tableName)
-			continue
-		}
-
-		// Determine which rows to capture based on query type and PK values
-		var rows []types.Row
-		switch queryInfo.Type {
-		case types.QueryTypeInsert:
-			// For INSERT, we capture nothing in pre-state (will use LastInsertId in post-state)
-			tableRoots[tableName] = "" // Empty root for non-existent pre-state
-
-		case types.QueryTypeUpdate, types.QueryTypeDelete:
-			// For UPDATE and DELETE, capture rows that will be affected
-			pkValues, hasPKs := queryInfo.PKValues[tableName]
-
-			if hasPKs && len(pkValues) > 0 {
-				// We have PK values from the WHERE clause, so we can capture specific rows
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
-				if err != nil {
-					return nil, nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
-			} else {
-				// Fall back to capturing all rows - this is inefficient but simple for V1
-				log.Warn("falling back to full table capture", "table", tableName, "query_type", queryInfo.Type)
-				capturedRows, err := captureAllRows(ctx, tx, tableName, schema)
-				if err != nil {
-					return nil, nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
+			// Get table schema (including PK information)
+			schema, err := getTableSchema(ctx, tx, tableName)
+			if err != nil {
+				errChan <- errors.WrapStateCaptureError(err, tableName)
+				return
 			}
 
-		case types.QueryTypeSelect:
-			// For SELECT, we don't need to capture anything
-			continue
+			// Skip tables without PKs - verification is not supported for these
+			if len(schema.PrimaryKey) == 0 {
+				log.Warn("skipping state capture for table without primary key",
+					"table", tableName)
+				return
+			}
 
-		default:
-			log.Warn("unsupported query type for state capture", "query_type", queryInfo.Type)
-			continue
-		}
+			schemasMutex.Lock()
+			schemas[tableName] = schema
+			schemasMutex.Unlock()
 
-		state[tableName] = rows
+			// Check if we have PK values to capture rows
+			if pkValues, ok := queryInfo.PKValues[tableName]; ok && len(pkValues) > 0 {
+				// Capture specific rows that will be affected
+				rows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
+				if err != nil {
+					errChan <- errors.Wrapf(err, "failed to capture rows by PK for table %s", tableName)
+					return
+				}
 
-		// Generate Merkle root for this table
+				preStateMutex.Lock()
+				preState[tableName] = rows
+				preStateMutex.Unlock()
+
+				log.Debug("captured pre-state by PK",
+					"table", tableName,
+					"row_count", len(rows),
+					"pk_values", pkValues)
+			} else {
+				// Fallback to capturing all rows in the table
+				log.Warn("falling back to full table capture for pre-state",
+					"table", tableName,
+					"query_type", queryInfo.Type,
+					"sql", queryInfo.SQL)
+
+				rows, err := captureAllRows(ctx, tx, tableName, schema)
+				if err != nil {
+					errChan <- errors.Wrapf(err, "failed to capture all rows for table %s", tableName)
+					return
+				}
+
+				preStateMutex.Lock()
+				preState[tableName] = rows
+				preStateMutex.Unlock()
+
+				log.Debug("captured all rows for pre-state",
+					"table", tableName,
+					"row_count", len(rows))
+			}
+		}(table)
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	var errs []string
+	for err := range errChan {
+		errs = append(errs, err.Error())
+	}
+
+	if len(errs) > 0 {
+		// Join all errors into a single error message
+		return nil, nil, "", errors.Wrap(errors.ErrStateCapture, strings.Join(errs, "; "))
+	}
+
+	// Check if we have an empty pre-state (which is valid if no tables with PKs)
+	if len(preState) == 0 {
+		log.Warn("no pre-state captured", "tables", queryInfo.Tables)
+		return preState, schemas, "", nil
+	}
+
+	// Generate a Merkle root commitment of the pre-state
+	tableRoots := make(map[string]string)
+	for tableName, rows := range preState {
 		tableRoot, err := commitment.GenerateTableRoot(tableName, rows)
 		if err != nil {
-			return nil, nil, "", fmt.Errorf("failed to generate table root for %s: %v", tableName, err)
+			return nil, nil, "", errors.Wrapf(err, "failed to generate table root for %s", tableName)
 		}
 		tableRoots[tableName] = tableRoot
 	}
@@ -189,130 +262,168 @@ func CapturePreStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryI
 	// Generate overall database root
 	dbRoot := commitment.GenerateDatabaseRoot(tableRoots)
 
-	return state, schemas, dbRoot, nil
+	return preState, schemas, dbRoot, nil
 }
 
 // CapturePostStateInTx captures the state of affected rows after executing a query
 func CapturePostStateInTx(ctx context.Context, tx *sql.Tx, queryInfo types.QueryInfo, result sql.Result, preState map[string][]types.Row, schemas map[string]types.TableSchema, args []interface{}) (map[string][]types.Row, string, error) {
 	if len(queryInfo.Tables) == 0 {
-		return nil, "", fmt.Errorf("no tables identified in query")
+		return nil, "", errors.Wrap(errors.ErrStateCapture, "no tables identified in query")
 	}
 
 	// Capture state for each affected table
-	state := make(map[string][]types.Row)
+	postState := make(map[string][]types.Row)
 	tableRoots := make(map[string]string)
 
+	// Synchronization for concurrent state captures
+	var wg sync.WaitGroup
+	postStateMutex := &sync.Mutex{}
+	errChan := make(chan error, len(queryInfo.Tables))
+
 	for _, tableName := range queryInfo.Tables {
-		schema, found := schemas[tableName]
-		if !found {
-			return nil, "", fmt.Errorf("schema not found for table %s", tableName)
-		}
+		wg.Add(1)
+		go func(tableName string) {
+			defer wg.Done()
 
-		// Skip tables without a primary key for simplicity in V1
-		if len(schema.PrimaryKey) == 0 {
-			log.Warn("skipping state capture for table without primary key", "table", tableName)
-			continue
-		}
+			schema, found := schemas[tableName]
+			if !found {
+				errChan <- errors.Newf("schema not found for table %s", tableName)
+				return
+			}
 
-		// Determine which rows to capture based on query type and PK values
-		var rows []types.Row
-		switch queryInfo.Type {
-		case types.QueryTypeInsert:
-			// For INSERT, capture the newly inserted row using last_insert_rowid()
-			lastID, err := result.LastInsertId()
+			// Skip tables without a primary key for V1
+			if len(schema.PrimaryKey) == 0 {
+				log.Warn("skipping verification for table without primary key",
+					"table", tableName,
+					"query_type", queryInfo.Type)
+				return
+			}
+
+			// Determine which rows to capture based on query type and PK values
+			var rows []types.Row
+			var captureErr error
+
+			switch queryInfo.Type {
+			case types.QueryTypeInsert:
+				// For INSERT, capture the newly inserted row using last_insert_rowid()
+				lastID, err := result.LastInsertId()
+				if err != nil {
+					log.Warn("failed to get last insert ID, falling back to full table capture",
+						"table", tableName,
+						"error", err)
+					
+					rows, captureErr = captureAllRows(ctx, tx, tableName, schema)
+				} else {
+					log.Debug("capturing inserted row by ID",
+						"table", tableName,
+						"last_insert_id", lastID)
+					
+					rows, captureErr = captureRowsByPK(ctx, tx, tableName, schema, []types.Value{lastID}, args)
+				}
+
+			case types.QueryTypeUpdate:
+				// For UPDATE, recapture the same rows as in pre-state
+				pkValues, hasPKs := queryInfo.PKValues[tableName]
+
+				if hasPKs && len(pkValues) > 0 {
+					log.Debug("capturing updated rows by PK",
+						"table", tableName,
+						"pk_count", len(pkValues))
+					
+					rows, captureErr = captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
+				} else {
+					log.Warn("falling back to full table capture for post-state",
+						"table", tableName,
+						"query_type", queryInfo.Type,
+						"sql", queryInfo.SQL)
+					
+					rows, captureErr = captureAllRows(ctx, tx, tableName, schema)
+				}
+
+			case types.QueryTypeDelete:
+				// For DELETE, we should find rows that no longer exist
+				pkValues, hasPKs := queryInfo.PKValues[tableName]
+
+				if hasPKs && len(pkValues) > 0 {
+					log.Debug("verifying deleted rows by PK",
+						"table", tableName,
+						"pk_count", len(pkValues))
+					
+					rows, captureErr = captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
+				} else {
+					log.Warn("falling back to full table capture for deleted rows",
+						"table", tableName,
+						"query_type", queryInfo.Type,
+						"sql", queryInfo.SQL)
+					
+					rows, captureErr = captureAllRows(ctx, tx, tableName, schema)
+				}
+
+			case types.QueryTypeSelect:
+				// For SELECT, we don't need to capture anything
+				log.Debug("skipping post-state capture for SELECT", "table", tableName)
+				return
+
+			default:
+				log.Warn("unsupported query type for state capture",
+					"query_type", queryInfo.Type,
+					"table", tableName)
+				return
+			}
+
+			if captureErr != nil {
+				errChan <- errors.Wrapf(captureErr, "failed to capture post-state for table %s", tableName)
+				return
+			}
+
+			// Store captured rows in post-state
+			postStateMutex.Lock()
+			postState[tableName] = rows
+			postStateMutex.Unlock()
+
+			// Generate Merkle root for this table
+			tableRoot, err := commitment.GenerateTableRoot(tableName, rows)
 			if err != nil {
-				log.Warn("failed to get last insert ID", "error", err)
-				// Fall back to capturing all rows
-				capturedRows, err := captureAllRows(ctx, tx, tableName, schema)
-				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
-			} else {
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, []types.Value{lastID}, args)
-				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture row by ID for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
+				errChan <- errors.Wrapf(err, "failed to generate table root for %s", tableName)
+				return
 			}
 
-		case types.QueryTypeUpdate:
-			// For UPDATE, recapture the same rows as in pre-state
-			pkValues, hasPKs := queryInfo.PKValues[tableName]
+			// Store table root
+			postStateMutex.Lock()
+			tableRoots[tableName] = tableRoot
+			postStateMutex.Unlock()
 
-			if hasPKs && len(pkValues) > 0 {
-				// We have PK values from the WHERE clause
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
-				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
-			} else {
-				// Fall back to capturing all rows
-				log.Warn("falling back to full table capture", "table", tableName, "query_type", queryInfo.Type)
-				capturedRows, err := captureAllRows(ctx, tx, tableName, schema)
-				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
-			}
+			log.Debug("captured post-state",
+				"table", tableName,
+				"row_count", len(rows))
+		}(tableName)
+	}
 
-		case types.QueryTypeDelete:
-			// For DELETE, we should find rows that no longer exist
-			// In post-state, these rows should be gone - compare with pre-state
-			// Note: we don't actually use preRows here but will compare results later
-			// _ = preState[tableName] // For completeness
+	// Wait for all goroutines to finish
+	wg.Wait()
+	close(errChan)
 
-			pkValues, hasPKs := queryInfo.PKValues[tableName]
+	// Check for errors
+	var errs []string
+	for err := range errChan {
+		errs = append(errs, err.Error())
+	}
 
-			if hasPKs && len(pkValues) > 0 {
-				// We have PK values from the WHERE clause
-				capturedRows, err := captureRowsByPK(ctx, tx, tableName, schema, pkValues, args)
-				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
-			} else {
-				// Fall back to capturing all rows
-				log.Warn("falling back to full table capture", "table", tableName, "query_type", queryInfo.Type)
-				capturedRows, err := captureAllRows(ctx, tx, tableName, schema)
-				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
-				}
-				rows = capturedRows
-			}
-
-			// Note: for DELETE, the post-state will have fewer rows than pre-state
-
-		case types.QueryTypeSelect:
-			// For SELECT, we don't need to capture anything
-			continue
-
-		default:
-			log.Warn("unsupported query type for state capture", "query_type", queryInfo.Type)
-			continue
-		}
-
-		state[tableName] = rows
-
-		// Generate Merkle root for this table
-		tableRoot, err := commitment.GenerateTableRoot(tableName, rows)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to generate table root for %s: %v", tableName, err)
-		}
-		tableRoots[tableName] = tableRoot
+	if len(errs) > 0 {
+		// Join all errors into a single error message
+		return nil, "", errors.Wrap(errors.ErrStateCapture, strings.Join(errs, "; "))
 	}
 
 	// Generate overall database root
 	dbRoot := commitment.GenerateDatabaseRoot(tableRoots)
 
-	return state, dbRoot, nil
+	return postState, dbRoot, nil
 }
 
 // CapturePostStateWithPgx captures the state of affected rows after executing a query using pgx
 func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx pgx.Tx, result sql.Result, preState map[string][]types.Row, schemas map[string]types.TableSchema, args []interface{}) (map[string][]types.Row, string, error) {
 	if len(queryInfo.Tables) == 0 {
-		return nil, "", fmt.Errorf("no tables identified in query")
+		return nil, "", errors.New("no tables identified in query")
 	}
 
 	// Capture state for each affected table
@@ -322,12 +433,14 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 	for _, tableName := range queryInfo.Tables {
 		schema, found := schemas[tableName]
 		if !found {
-			return nil, "", fmt.Errorf("schema not found for table %s", tableName)
+			return nil, "", errors.Newf("schema not found for table %s", tableName)
 		}
 
 		// Skip tables without a primary key for simplicity in V1
 		if len(schema.PrimaryKey) == 0 {
-			log.Warn("skipping state capture for table without primary key", "table", tableName)
+			log.Warn("skipping verification for table without primary key - consider adding a primary key for V1 verification support", 
+				"table", tableName,
+				"query_type", queryInfo.Type)
 			continue
 		}
 
@@ -342,13 +455,13 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 				// Fall back to capturing all rows
 				capturedRows, err := captureAllRowsWithPgx(ctx, tx, tableName, schema)
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
+					return nil, "", errors.Wrapf(err, "failed to capture all rows for table %s", tableName)
 				}
 				rows = capturedRows
 			} else {
 				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, []types.Value{lastID}, args)
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture row by ID for table %s: %v", tableName, err)
+					return nil, "", errors.Wrapf(err, "failed to capture row by ID for table %s", tableName)
 				}
 				rows = capturedRows
 			}
@@ -361,15 +474,18 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 				// We have PK values from the WHERE clause
 				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
+					return nil, "", errors.Wrapf(err, "failed to capture rows by PK for table %s", tableName)
 				}
 				rows = capturedRows
 			} else {
 				// Fall back to capturing all rows
-				log.Warn("falling back to full table capture", "table", tableName, "query_type", queryInfo.Type)
+				log.Warn("falling back to full table capture - WHERE clause could not be parsed for PK values", 
+					"table", tableName, 
+					"query_type", queryInfo.Type, 
+					"sql", queryInfo.SQL)
 				capturedRows, err := captureAllRowsWithPgx(ctx, tx, tableName, schema)
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
+					return nil, "", errors.Wrapf(err, "failed to capture all rows for table %s", tableName)
 				}
 				rows = capturedRows
 			}
@@ -381,13 +497,13 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 			if hasPKs && len(pkValues) > 0 {
 				capturedRows, err := captureRowsByPKWithPgx(ctx, tx, tableName, schema, pkValues, args)
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture rows by PK for table %s: %v", tableName, err)
+					return nil, "", errors.Wrapf(err, "failed to capture rows by PK for table %s", tableName)
 				}
 				rows = capturedRows
 			} else {
 				capturedRows, err := captureAllRowsWithPgx(ctx, tx, tableName, schema)
 				if err != nil {
-					return nil, "", fmt.Errorf("failed to capture all rows for table %s: %v", tableName, err)
+					return nil, "", errors.Wrapf(err, "failed to capture all rows for table %s", tableName)
 				}
 				rows = capturedRows
 			}
@@ -406,7 +522,7 @@ func CapturePostStateWithPgx(ctx context.Context, queryInfo types.QueryInfo, tx 
 		// Generate Merkle root for this table
 		tableRoot, err := commitment.GenerateTableRoot(tableName, rows)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to generate table root for %s: %v", tableName, err)
+			return nil, "", errors.Wrapf(err, "failed to generate table root for %s", tableName)
 		}
 		tableRoots[tableName] = tableRoot
 	}
@@ -462,14 +578,14 @@ func captureRowsByPK(ctx context.Context, tx *sql.Tx, tableName string, schema t
 	// Execute the query
 	resultRows, err := tx.QueryContext(ctx, query, resolvedArgs...)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to execute query")
 	}
 	defer resultRows.Close()
 
 	// Process the results
 	columns, err := resultRows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to get columns")
 	}
 
 	for resultRows.Next() {
@@ -481,7 +597,7 @@ func captureRowsByPK(ctx context.Context, tx *sql.Tx, tableName string, schema t
 		}
 
 		if err := resultRows.Scan(valuePtrs...); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to scan row")
 		}
 
 		// Convert to a map of column name to value
@@ -501,7 +617,7 @@ func captureRowsByPK(ctx context.Context, tx *sql.Tx, tableName string, schema t
 	}
 
 	if err = resultRows.Err(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read rows")
 	}
 
 	return rows, nil
@@ -514,14 +630,14 @@ func captureAllRows(ctx context.Context, tx *sql.Tx, tableName string, schema ty
 	// Execute the query
 	resultRows, err := tx.QueryContext(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to execute query")
 	}
 	defer resultRows.Close()
 
 	// Process the results
 	columns, err := resultRows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to get columns")
 	}
 
 	var rows []types.Row
@@ -534,7 +650,7 @@ func captureAllRows(ctx context.Context, tx *sql.Tx, tableName string, schema ty
 		}
 
 		if err := resultRows.Scan(valuePtrs...); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to scan row")
 		}
 
 		// Convert to a map of column name to value
@@ -554,7 +670,7 @@ func captureAllRows(ctx context.Context, tx *sql.Tx, tableName string, schema ty
 	}
 
 	if err = resultRows.Err(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read rows")
 	}
 
 	return rows, nil
@@ -605,7 +721,7 @@ func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sc
 	// Execute the query
     pgxRows, err := tx.Query(ctx, query, resolvedArgs...)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to execute query")
 	}
 	defer pgxRows.Close()
 
@@ -619,7 +735,7 @@ func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sc
 
 		// Scan the row data
 		if err := pgxRows.Scan(scanDest...); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to scan row")
 		}
 
 		// Create a Row object with column values
@@ -641,7 +757,7 @@ func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sc
 		for _, pkCol := range schema.PrimaryKey {
 			idx, exists := colIndices[pkCol]
 			if !exists {
-				return nil, fmt.Errorf("primary key column %s not found in result set", pkCol)
+				return nil, errors.Newf("primary key column %s not found in result set", pkCol)
 			}
 			valPtr := scanDest[idx].(*interface{})
 			if *valPtr != nil {
@@ -657,7 +773,7 @@ func captureRowsByPKWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sc
 	}
 
 	if err := pgxRows.Err(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read rows")
 	}
 
 	return rows, nil
@@ -687,7 +803,7 @@ func captureAllRowsWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sch
 	// Execute the query
 	pgxRows, err := tx.Query(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to execute query")
 	}
 	defer pgxRows.Close()
 
@@ -701,7 +817,7 @@ func captureAllRowsWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sch
 
 		// Scan the row data
 		if err := pgxRows.Scan(scanDest...); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to scan row")
 		}
 
 		// Create a Row object
@@ -719,7 +835,7 @@ func captureAllRowsWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sch
 
 		// Generate a row ID from primary key values
 		if len(schema.PrimaryKey) == 0 {
-			return nil, fmt.Errorf("table %s has no primary key", tableName)
+			return nil, errors.Newf("table %s has no primary key", tableName)
 		}
 
 		// Create a map that contains only the PK values for this row
@@ -727,7 +843,7 @@ func captureAllRowsWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sch
 		for _, pkCol := range schema.PrimaryKey {
 			idx, exists := colIndices[pkCol]
 			if !exists {
-				return nil, fmt.Errorf("primary key column %s not found in result set", pkCol)
+				return nil, errors.Newf("primary key column %s not found in result set", pkCol)
 			}
 			valPtr := scanDest[idx].(*interface{})
 			if *valPtr != nil {
@@ -743,7 +859,7 @@ func captureAllRowsWithPgx(ctx context.Context, tx pgx.Tx, tableName string, sch
 	}
 
 	if err := pgxRows.Err(); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read rows")
 	}
 
 	return rows, nil

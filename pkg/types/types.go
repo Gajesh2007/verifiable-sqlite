@@ -8,6 +8,19 @@ import (
 
 // Value represents a database value with type information
 // For V1, we use interface{} but this will need stricter typing later
+//
+// The expected underlying Go types for SQLite data types are:
+// - INTEGER: int64
+// - REAL: float64
+// - TEXT: string
+// - BLOB: []byte
+// - NULL: nil
+// - BOOLEAN: bool (mapped from INTEGER internally)
+// - DATETIME: time.Time (mapped from TEXT internally)
+//
+// When serializing values for state capture or verification, the system
+// expects these specific Go types. Other types may cause unpredictable behavior
+// during verification.
 type Value interface{}
 
 // ColumnInfo describes a column in a database table

@@ -12,17 +12,50 @@ import (
 var (
 	verificationEngine *replay.Engine
 	metricsCollector   *metrics.Metrics
+	metricsSingleton   *metrics.Metrics
 )
 
-// InitVerification sets up the verification engine
+// Initialize the verification engine and other components
+func init() {
+	// Initialize the metrics collector
+	metricsCollector = metrics.NewMetrics()
+	metricsSingleton = metricsCollector
+	
+	// Load default configuration
+	defaultCfg, err := config.Load()
+	if err != nil {
+		log.Error("failed to load configuration", "error", err)
+		// Use default config if loading fails
+		defaultCfg = config.DefaultConfig()
+	}
+	
+	// Start metrics server if enabled
+	if defaultCfg.MetricsServerEnabled {
+		if err := metricsCollector.StartMetricsServer(defaultCfg.MetricsServerAddr); err != nil {
+			log.Error("failed to start metrics server", "error", err)
+		}
+	}
+	
+	// By default, don't start the verification engine here.
+	// Tests and applications should call InitVerification explicitly
+}
+
+// InitVerification sets up the verification engine with the provided configuration
+// This is used by tests and applications to initialize the verification engine
 func InitVerification(cfg config.Config) {
 	log.SetupDefault()
 	
-	// Initialize metrics collector
-	metricsCollector = metrics.NewMetrics()
+	// Reuse the metrics collector initialized in the init() function
+	// or create a new one if it hasn't been initialized yet
+	if metricsCollector == nil {
+		metricsCollector = metrics.NewMetrics()
+		metricsSingleton = metricsCollector
+	}
 	
 	// Start metrics server if enabled
 	if cfg.MetricsServerEnabled {
+		// Try to start the metrics server - StartMetricsServer will handle
+		// the case where a server is already running
 		if err := metricsCollector.StartMetricsServer(cfg.MetricsServerAddr); err != nil {
 			log.Error("failed to start metrics server", "error", err)
 		}
@@ -30,9 +63,11 @@ func InitVerification(cfg config.Config) {
 	
 	// Create and start the replay engine
 	if cfg.EnableVerification {
-		verificationEngine = replay.NewEngine(cfg)
-		// Pass metrics to the engine
-		verificationEngine.SetMetrics(metricsCollector)
+		engineOpts := []replay.EngineOption{
+			replay.WithMetrics(metricsCollector),
+			replay.WithTimeout(time.Duration(cfg.VerificationTimeoutMs) * time.Millisecond),
+		}
+		verificationEngine = replay.NewEngine(cfg.JobQueueSize, cfg.WorkerCount, engineOpts...)
 		verificationEngine.Start()
 	}
 }
@@ -54,7 +89,12 @@ func GetVerificationEngine() *replay.Engine {
 	return verificationEngine
 }
 
-// GetMetrics returns the global metrics collector
+// GetMetrics returns the metrics collector for testing and inspection
 func GetMetrics() *metrics.Metrics {
-	return metricsCollector
+	return metricsSingleton
+}
+
+// SetMetrics sets the metrics collector - useful for testing
+func SetMetrics(m *metrics.Metrics) {
+	metricsSingleton = m
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gaj/verifiable-sqlite/pkg/capture"
 	"github.com/gaj/verifiable-sqlite/pkg/config"
+	"github.com/gaj/verifiable-sqlite/pkg/errors"
 	"github.com/gaj/verifiable-sqlite/pkg/interceptor"
 	"github.com/gaj/verifiable-sqlite/pkg/log"
 	"github.com/gaj/verifiable-sqlite/pkg/metrics"
@@ -47,22 +48,46 @@ type Engine struct {
 	mu          sync.Mutex
 	config      config.Config
 	metrics     *metrics.Metrics // Metrics collector for observability
+	timeout     time.Duration
 }
 
-// NewEngine creates a new replay engine
-func NewEngine(cfg config.Config) *Engine {
-	return &Engine{
-		jobQueue:    make(chan types.VerificationJob, cfg.JobQueueSize),
-		workerCount: cfg.WorkerCount,
-		stopCh:      make(chan struct{}),
-		config:      cfg,
-		// Initialize metrics inline for standalone use, but can be overridden with SetMetrics
-		metrics:     nil,
+// EngineOption is a function that configures an Engine
+type EngineOption func(*Engine)
+
+// WithMetrics sets the metrics collector for the engine
+func WithMetrics(m *metrics.Metrics) EngineOption {
+	return func(e *Engine) {
+		e.metrics = m
 	}
 }
 
+// WithTimeout sets the verification timeout for the engine
+func WithTimeout(timeout time.Duration) EngineOption {
+	return func(e *Engine) {
+		e.timeout = timeout
+	}
+}
+
+// NewEngine creates a new replay engine
+func NewEngine(jobQueueSize, workerCount int, opts ...EngineOption) *Engine {
+	e := &Engine{
+		jobQueue:    make(chan types.VerificationJob, jobQueueSize),
+		workerCount: workerCount,
+		stopCh:      make(chan struct{}),
+		running:     false,
+		timeout:     5 * time.Second, // Default timeout
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(e)
+	}
+
+	return e
+}
+
 // SetMetrics sets the metrics collector for the engine
-// This allows the vsqlite package to inject a shared metrics collector
+// This is kept for backward compatibility
 func (e *Engine) SetMetrics(m *metrics.Metrics) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -148,7 +173,7 @@ func (e *Engine) worker(id int) {
 			// Create a context with timeout
 			ctx, cancel := context.WithTimeout(
 				context.Background(),
-				time.Duration(e.config.VerificationTimeoutMs)*time.Millisecond,
+				e.timeout,
 			)
 			
 			// Process the job
@@ -188,7 +213,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 
     verificationDB, err := SetupVerificationDB(ctx, job.TableSchemas, job.PreStateData)
     if err != nil {
-        result.Error = fmt.Sprintf("failed to set up verification DB: %v", err)
+        result.Error = errors.Wrap(err, "failed to set up verification DB").Error()
         result.Duration = time.Since(startTime)
         return result
     }
@@ -240,7 +265,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
         // Execute the sequence of SQL statements
         tx, err = ExecuteQueriesSequenceDeterministically(ctx, verificationDB, job.SQLSequence, job.ArgsSequence)
         if err != nil {
-            result.Error = fmt.Sprintf("failed to execute SQL sequence: %v", err)
+            result.Error = errors.Wrapf(err, "failed to execute SQL sequence with %d statements", len(job.SQLSequence)).Error()
             result.Duration = time.Since(startTime)
             return result
         }
@@ -255,7 +280,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
         
         postState, postRoot, err = capture.CapturePostStateInTx(ctx, tx, combinedQueryInfo, mockResult, job.PreStateData, job.TableSchemas, nil)
         if err != nil {
-            result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
+            result.Error = errors.Wrap(err, "failed to capture post-state").Error()
             result.Duration = time.Since(startTime)
             return result
         }
@@ -278,7 +303,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
         // ------------------------------------------------------------------
         queryInfo, err := interceptor.AnalyzeQuery(sqlToExecute)
         if err != nil {
-            result.Error = fmt.Sprintf("failed to analyze query: %v", err)
+            result.Error = errors.Wrap(err, "failed to analyze query").Error()
             result.Duration = time.Since(startTime)
             return result
         }
@@ -289,7 +314,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
         // ------------------------------------------------------------------
         tx, err = ExecuteQueriesDeterministically(ctx, verificationDB, sqlToExecute, job.Args...)
         if err != nil {
-            result.Error = fmt.Sprintf("failed to execute query: %v", err)
+            result.Error = errors.Wrap(err, "failed to execute query").Error()
             result.Duration = time.Since(startTime)
             return result
         }
@@ -303,7 +328,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
     
         postState, postRoot, err = capture.CapturePostStateInTx(ctx, tx, queryInfo, mockResult, job.PreStateData, job.TableSchemas, job.Args)
         if err != nil {
-            result.Error = fmt.Sprintf("failed to capture post-state: %v", err)
+            result.Error = errors.Wrap(err, "failed to capture post-state").Error()
             result.Duration = time.Since(startTime)
             return result
         }
@@ -329,6 +354,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
             mismatches = []string{"Failed to calculate post-state for comparison"}
         }
         result.Mismatches = mismatches
+        result.Error = errors.StateMismatch.Error()
 
         result.Duration = time.Since(startTime)
         return result // success=false by default

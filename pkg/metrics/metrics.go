@@ -18,6 +18,10 @@ type Metrics struct {
 	TxCommitted   atomic.Int64
 	TxRolledBack  atomic.Int64
 	
+	// Connection metrics
+	ConnectionsOpened  atomic.Int64
+	ConnectionsClosed  atomic.Int64
+	
 	// Query metrics
 	QueriesExecuted         atomic.Int64
 	QueriesVerified         atomic.Int64
@@ -139,6 +143,16 @@ func (m *Metrics) Update(result types.VerificationResult) {
 	}
 }
 
+// IncrementConnectionOpened increments the count of opened database connections
+func (m *Metrics) IncrementConnectionOpened() {
+	m.ConnectionsOpened.Add(1)
+}
+
+// IncrementConnectionClosed increments the count of closed database connections
+func (m *Metrics) IncrementConnectionClosed() {
+	m.ConnectionsClosed.Add(1)
+}
+
 // MetricsHandler returns an HTTP handler for metrics
 func (m *Metrics) MetricsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +163,11 @@ func (m *Metrics) MetricsHandler() http.HandlerFunc {
 		fmt.Fprintf(w, "vsqlite_tx_started %d\n", m.TxStarted.Load())
 		fmt.Fprintf(w, "vsqlite_tx_committed %d\n", m.TxCommitted.Load())
 		fmt.Fprintf(w, "vsqlite_tx_rolled_back %d\n", m.TxRolledBack.Load())
+		
+		// Connection metrics
+		fmt.Fprintf(w, "\n# Connection Metrics\n")
+		fmt.Fprintf(w, "vsqlite_connections_opened %d\n", m.ConnectionsOpened.Load())
+		fmt.Fprintf(w, "vsqlite_connections_closed %d\n", m.ConnectionsClosed.Load())
 		
 		// Query metrics
 		fmt.Fprintf(w, "\n# Query Metrics\n")
