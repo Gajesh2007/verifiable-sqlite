@@ -1,9 +1,10 @@
 package vsqlite
 
 import (
-	"context"
-	"database/sql"
-	"time"
+    "context"
+    "database/sql"
+    "strings"
+    "time"
 
 	"github.com/gaj/verifiable-sqlite/pkg/capture"
 	"github.com/gaj/verifiable-sqlite/pkg/interceptor"
@@ -18,6 +19,15 @@ type Tx struct {
 	ctx     context.Context
 	txID    string
 	queries []string
+
+	// Aggregated verification data (per full transaction)
+	preCaptured bool
+	preState    map[string][]types.Row
+	schemas     map[string]types.TableSchema
+	preRoot     string
+
+	postState   map[string][]types.Row
+	postRoot    string
 }
 
 // ExecContext executes a query within the transaction
@@ -48,76 +58,50 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...interface{}
 
 // execWithVerification executes a DML query with state capture and verification
 func (tx *Tx) execWithVerification(ctx context.Context, queryInfo types.QueryInfo, query string, args ...interface{}) (sql.Result, error) {
-	// Track performance
-	startTime := time.Now()
+    startTime := time.Now()
 
-	// 1. Capture pre-state
-	preState, schemas, preRoot, err := capture.CapturePreStateInTx(ctx, tx.Tx, queryInfo, args)
-	if err != nil {
-		log.Warn("failed to capture pre-state", "tx_id", tx.txID, "error", err)
-		// Continue with execution even if capture fails
-	}
+    // Capture pre-state once (before the first DML in this Tx)
+    if !tx.preCaptured {
+        pre, sch, root, err := capture.CapturePreStateInTx(ctx, tx.Tx, queryInfo, args)
+        if err != nil {
+            log.Warn("failed to capture pre-state", "tx_id", tx.txID, "error", err)
+            if metricsCollector != nil {
+                metricsCollector.IncrementErrors()
+            }
+        } else {
+            tx.preCaptured = true
+            tx.preState = pre
+            tx.schemas = sch
+            tx.preRoot = root
+        }
+    }
 
-	// 2. Execute the user's query
-	result, err := tx.Tx.ExecContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
+    // Execute the user query
+    result, err := tx.Tx.ExecContext(ctx, query, args...)
+    if err != nil {
+        if metricsCollector != nil {
+            metricsCollector.IncrementErrors()
+        }
+        return nil, err
+    }
 
-	// 3. Capture post-state
-	postState, postRoot, err := capture.CapturePostStateInTx(ctx, tx.Tx, queryInfo, result, preState, schemas, args)
-	if err != nil {
-		log.Warn("failed to capture post-state", "tx_id", tx.txID, "error", err)
-		// Continue even if capture fails, just skip verification
-	}
+    // Update post-state snapshot after this statement
+    post, root, err := capture.CapturePostStateInTx(ctx, tx.Tx, queryInfo, result, tx.preState, tx.schemas, args)
+    if err == nil {
+        tx.postState = post
+        tx.postRoot = root
+    } else {
+        if metricsCollector != nil {
+            metricsCollector.IncrementErrors()
+        }
+    }
 
-	// Calculate execution time
-	executionTime := time.Since(startTime).Milliseconds()
+    // Metrics per statement
+    if metricsCollector != nil {
+        metricsCollector.RecordQuery(queryInfo.Type.String(), time.Since(startTime).Nanoseconds())
+    }
 
-	// Record query metrics if collector is available
-	if metricsCollector != nil {
-		opName := queryInfo.Type.String()
-		metricsCollector.RecordQuery(opName, time.Since(startTime).Nanoseconds())
-	}
-
-	// 4. Log state commitment record
-	commitmentRecord := types.StateCommitmentRecord{
-		TxID:            tx.txID,
-		Query:           queryInfo.Type.String() + " query",
-		SQL:             query,
-		Timestamp:       time.Now(),
-		PreRootCaptured: preRoot,
-		PostRootClaimed: postRoot,
-		PerformanceMs:   executionTime,
-	}
-	log.LogStateCommitment(commitmentRecord)
-
-	// 5. Submit verification job asynchronously
-	if verificationEngine != nil {
-		// Convert args to interface{} slice that can be stored
-		queryArgs := make([]interface{}, len(args))
-		for i, arg := range args {
-			queryArgs[i] = arg
-		}
-		
-		job := types.VerificationJob{
-			TxID:            tx.txID,
-			Query:           queryInfo.Type.String(),
-			SQL:             query,
-			Args:            queryArgs,
-			PreStateData:    preState,
-			PostStateData:   postState,
-			TableSchemas:    schemas,
-			PreRootCaptured: preRoot,
-			PostRootClaimed: postRoot,
-		}
-
-		if err := verificationEngine.SubmitJob(job); err != nil {
-			log.Warn("failed to submit verification job", "tx_id", tx.txID, "error", err)
-		}
-	}
-
-	return result, nil
+    return result, nil
 }
 
 // Exec executes a query within the transaction
@@ -181,6 +165,27 @@ func (tx *Tx) Commit() error {
 		log.Info("transaction committed",
 			"tx_id", tx.txID,
 			"query_count", len(tx.queries))
+	}
+
+	// If verification data was captured, submit a single job now
+	if err == nil && tx.preCaptured && verificationEngine != nil {
+		job := types.VerificationJob{
+			TxID:            tx.txID,
+			Query:           "TRANSACTION",
+			SQL:             strings.Join(tx.queries, ";\n"),
+			Args:            nil, // Not replaying with placeholders across multi stmt yet
+			PreStateData:    tx.preState,
+			PostStateData:   tx.postState,
+			TableSchemas:    tx.schemas,
+			PreRootCaptured: tx.preRoot,
+			PostRootClaimed: tx.postRoot,
+		}
+        if errSubmit := verificationEngine.SubmitJob(job); errSubmit != nil {
+            log.Warn("failed to submit verification job", "tx_id", tx.txID, "error", errSubmit)
+            if metricsCollector != nil {
+                metricsCollector.IncrementErrors()
+            }
+		}
 	}
 
 	if metricsCollector != nil {
